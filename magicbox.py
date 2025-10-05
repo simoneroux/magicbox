@@ -16,9 +16,7 @@ class MagicBox:
         self.room = room
         self.clf = None
         self.is_running = True
-        
-        # Configure Roku settings
-        self.roku_ip = os.getenv("ROKU_IP", "192.168.68.106")
+        self.vlc_process = None
         
         logging.basicConfig(
             level=logging.INFO,
@@ -27,70 +25,180 @@ class MagicBox:
         self.logger = logging.getLogger(__name__)
 
     def play_sound(self, sound_type="success"):
-        """Play a feedback sound through the Raspberry Pi headphone jack
-        
-        Args:
-            sound_type (str): Type of sound to play ("success", "error", "info", or "scan")
-        """
+        """Play a feedback sound through the Raspberry Pi headphone jack"""
         try:
-            # Sound configurations - different frequencies for different sounds
             sounds = {
-                "success": {"freq": 880, "duration": 0.2},  # A5 note
-                "error": {"freq": 220, "duration": 0.3},    # A3 note
-                "info": {"freq": 440, "duration": 0.2},     # A4 note
-                "scan": {"freq": 660, "duration": 0.1}      # E5 note
+                "success": {"freq": 880, "duration": 0.2},
+                "error": {"freq": 220, "duration": 0.3},
+                "info": {"freq": 440, "duration": 0.2},
+                "scan": {"freq": 660, "duration": 0.1}
             }
             
-            # Default to success sound if type not found
             config = sounds.get(sound_type, sounds["success"])
+            freq = config["freq"]
+            duration = config["duration"]
+            sample_rate = 22050
+            amplitude = 0.5
             
-            # Sound parameters
-            freq = config["freq"]  # Frequency in Hz
-            duration = config["duration"]  # Duration in seconds
-            sample_rate = 22050  # Sample rate in Hz (CD quality is 44100)
-            amplitude = 0.5  # Volume (0.0 to 1.0)
-            
-            # Generate a sine wave (basic tone)
             t = np.linspace(0, duration, int(sample_rate * duration), False)
             tone = np.sin(2 * np.pi * freq * t) * amplitude
-            
-            # Convert to 16-bit PCM
             audio = (tone * 32767).astype(np.int16)
             
-            # Create a temporary WAV file
             fd, temp_file = tempfile.mkstemp(suffix='.wav')
             os.close(fd)
             
-            # Save the audio data to the temporary file
             with open(temp_file, 'wb') as f:
-                # Write WAV header (simple format)
                 f.write(b'RIFF')
-                f.write((36 + len(audio) * 2).to_bytes(4, 'little'))  # File size
+                f.write((36 + len(audio) * 2).to_bytes(4, 'little'))
                 f.write(b'WAVE')
-                # Format chunk
                 f.write(b'fmt ')
-                f.write((16).to_bytes(4, 'little'))  # Chunk size
-                f.write((1).to_bytes(2, 'little'))   # PCM format
-                f.write((1).to_bytes(2, 'little'))   # Mono
-                f.write((sample_rate).to_bytes(4, 'little'))  # Sample rate
-                f.write((sample_rate * 2).to_bytes(4, 'little'))  # Byte rate
-                f.write((2).to_bytes(2, 'little'))   # Block align
-                f.write((16).to_bytes(2, 'little'))  # Bits per sample
-                # Data chunk
+                f.write((16).to_bytes(4, 'little'))
+                f.write((1).to_bytes(2, 'little'))
+                f.write((1).to_bytes(2, 'little'))
+                f.write((sample_rate).to_bytes(4, 'little'))
+                f.write((sample_rate * 2).to_bytes(4, 'little'))
+                f.write((2).to_bytes(2, 'little'))
+                f.write((16).to_bytes(2, 'little'))
                 f.write(b'data')
-                f.write((len(audio) * 2).to_bytes(4, 'little'))  # Chunk size
+                f.write((len(audio) * 2).to_bytes(4, 'little'))
                 f.write(audio.tobytes())
             
-            # Play the sound using aplay (common on Raspberry Pi)
             subprocess.run(['aplay', '-q', temp_file], 
                            stdout=subprocess.DEVNULL, 
                            stderr=subprocess.DEVNULL)
-            
-            # Clean up the temporary file
             os.unlink(temp_file)
             
         except Exception as e:
             self.logger.error(f"Failed to play sound: {e}")
+
+    def is_tv_on(self):
+        """Check if TV is already on"""
+        try:
+            result = subprocess.run(
+                ['cec-client', '-s', '-d', '1'],
+                input='pow 0\n',  # Changed from b'pow 0\n' to regular string
+                capture_output=True,
+                text=True  # This tells subprocess to handle text encoding
+            )
+            # Check if response contains "power status: on"
+            return 'power status: on' in result.stdout.lower()
+        except Exception as e:
+            self.logger.error(f"TV status check error: {e}")
+            return False
+
+    def tv_on(self):
+        """Turn on TV and switch to Pi input - optimized with status check"""
+        try:
+            # Check if TV is already on
+            if self.is_tv_on():
+                print("📺 TV already on, switching input...")
+                # Just switch input
+                subprocess.run(
+                    ['cec-client', '-s', '-d', '1'],
+                    input='as\n',  # Changed from b'as\n'
+                    capture_output=True,
+                    text=True
+                )
+                time.sleep(1)  # Short wait for input switch
+                print("✅ TV ready")
+                return True
+            
+            # TV is off, need to turn it on
+            print("📺 Turning on TV...")
+            
+            # Turn on
+            subprocess.run(
+                ['cec-client', '-s', '-d', '1'],
+                input='on 0\n',  # Changed from b'on 0\n'
+                capture_output=True,
+                text=True
+            )
+            
+            # Reduced wait from 4 to 3 seconds
+            print("📺 Waiting 3 seconds...")
+            time.sleep(3)
+            
+            # Switch input
+            print("📺 Switching to Pi input...")
+            subprocess.run(
+                ['cec-client', '-s', '-d', '1'],
+                input='as\n',  # Changed from b'as\n'
+                capture_output=True,
+                text=True
+            )
+            
+            # Reduced wait from 2 to 1 second
+            time.sleep(1)
+            
+            print("✅ TV ready")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"TV on error: {e}")
+            return False
+
+    def tv_off(self):
+        """Turn off TV"""
+        try:
+            print("📺 Turning off TV...")
+            subprocess.run(
+                ['cec-client', '-s', '-d', '1'],
+                input='standby 0\n',  # Changed from b'standby 0\n'
+                capture_output=True,
+                text=True
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"TV off error: {e}")
+            return False
+
+    def stop_video(self):
+        """Stop any running video"""
+        try:
+            if self.vlc_process:
+                print("⏹️ Stopping video...")
+                self.vlc_process.terminate()
+                try:
+                    self.vlc_process.wait(timeout=2)
+                except:
+                    self.vlc_process.kill()
+                self.vlc_process = None
+            
+            # Also kill any stray VLC processes
+            subprocess.run(['pkill', 'vlc'], capture_output=True)
+            
+        except Exception as e:
+            self.logger.error(f"Stop video error: {e}")
+
+    def play_video(self, url, title=None):
+        """Play video from URL (Jellyfin, etc) - NON-BLOCKING"""
+        try:
+            print(f"🎬 Playing video: {title or url}")
+            
+            # Stop any current video
+            self.stop_video()
+            
+            # Stop any music
+            self.run_sonos_command("stop")
+            
+            # Turn on TV and switch input (optimized)
+            self.tv_on()
+            
+            # Start video in background
+            self.vlc_process = subprocess.Popen([
+                'cvlc',
+                '--fullscreen',
+                '--network-caching=3000',
+                '--play-and-exit',
+                url
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            print("✅ Video playing (scan another card to control)")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Video playback error: {e}")
+            return False
 
     def run_sonos_command(self, *args):
         """Execute a Sonos command via soco-cli"""
@@ -101,6 +209,12 @@ class MagicBox:
     def play_music(self, url, title=None, shuffle=False):
         """Play music from a streaming service URL"""
         try:
+            # Stop any video first
+            self.stop_video()
+            
+            # Turn off TV
+            self.tv_off()
+            
             # Clear queue and play
             self.run_sonos_command("clear_queue")
             code, _, stderr = self.run_sonos_command("play_sharelink", url)
@@ -123,18 +237,19 @@ class MagicBox:
             return False
 
     def handle_control(self, command):
-        """Handle basic playback controls"""
+        """Handle basic playback controls - universal for both music and video"""
         commands = {
             "play": ("play", "▶️ Playing"),
-            "stop": ("stop", "⏹️ Stopped"), 
+            "stop": lambda: (self.stop_video(), self.run_sonos_command("stop")),
             "next": ("next", "⏭️ Next track"),
             "prev": ("previous", "⏮️ Previous track"),
             "vol_up": lambda: self.adjust_volume(5),
-            "vol_down": lambda: self.adjust_volume(-5)
+            "vol_down": lambda: self.adjust_volume(-5),
+            "tv_on": lambda: self.tv_on(),
+            "tv_off": lambda: self.tv_off()
         }
 
         if command not in commands:
-            # Remove Roku control fallback
             self.play_sound("error")
             return False
 
@@ -142,13 +257,14 @@ class MagicBox:
         if callable(action):
             action()
             self.play_sound("success")
+            print(f"✅ {command}")
         else:
             code, _, stderr = self.run_sonos_command(action[0])
             self.play_sound("success" if code == 0 else "error")
             print(action[1] if code == 0 else f"❌ Failed: {stderr}")
 
     def adjust_volume(self, delta):
-        """Adjust volume up or down by delta"""
+        """Adjust volume up or down by delta - universal control"""
         code, volume, _ = self.run_sonos_command("volume")
         if code == 0:
             current = int(volume)
@@ -159,7 +275,6 @@ class MagicBox:
     def on_connect(self, tag):
         """Handle NFC tag connection"""
         try:
-            # Play a scan sound when a tag is detected
             self.play_sound("scan")
             
             if not tag.ndef:
@@ -170,11 +285,10 @@ class MagicBox:
             # Track card settings
             card_name = None
             content_type = None
-            content_id = None
             shuffle = False
             url = None
                 
-            # First scan for settings
+            # Parse tag
             for record in tag.ndef.records:
                 if record.type == "urn:nfc:wkt:T":
                     if ":" in record.text:
@@ -186,23 +300,29 @@ class MagicBox:
                             shuffle = True
                         elif identifier == "type":
                             content_type = content
-                        elif identifier == "id":
-                            content_id = content
                             
                 elif record.type == "urn:nfc:wkt:U":
                     url = record.uri
             
             # Handle different content types
-            if url and re.match(r'^https?://(open\.spotify\.com|music\.apple\.com|tidal\.com|www\.deezer\.com)/', url):
+            if content_type == "video" and url:
+                # Play video (Jellyfin, direct URLs)
+                result = self.play_video(url, card_name)
+                self.play_sound("success" if result else "error")
+                return True
+                
+            elif url and re.match(r'^https?://(open\.spotify\.com|music\.apple\.com|tidal\.com|www\.deezer\.com)/', url):
+                # Play music
                 result = self.play_music(url, card_name, shuffle)
                 self.play_sound("success" if result else "error")
                 return True
+                
             elif not url:
-                # Handle control commands
+                # Handle control commands (universal for music and video)
                 for record in tag.ndef.records:
-                    if record.type == "urn:nfc:wkt:T" and not ":" in record.text:
+                    if record.type == "urn:nfc:wkt:T" and ":" not in record.text:
                         command = record.text.lower()
-                        valid_commands = ["play", "stop", "next", "prev", "vol_up", "vol_down"]
+                        valid_commands = ["play", "stop", "next", "prev", "vol_up", "vol_down", "tv_on", "tv_off"]
                         if command in valid_commands:
                             self.handle_control(command)
                             return True
@@ -244,11 +364,17 @@ class MagicBox:
         """Clean shutdown on Ctrl+C/Z"""
         print("\n👋 Shutting down Magic Box...")
         self.is_running = False
+        
+        # Stop everything
+        self.stop_video()
+        self.run_sonos_command("stop")
+        self.tv_off()
+        
         if self.clf:
             self.clf.close()
-        # Play a goodbye sound
+        
         self.play_sound("info")
-        time.sleep(0.3)  # Wait for the sound to finish
+        time.sleep(0.3)
         sys.exit(0)
 
     def start(self):
@@ -262,11 +388,12 @@ class MagicBox:
         signal.signal(signal.SIGTSTP, self.handle_quit)
         
         print("\n✨ Magic Box Ready")
-        print(f"🔈 Speaker: {self.room}")
-        print(f"📺 Roku TV: {self.roku_ip}")
+        print(f"🔈 Sonos: {self.room}")
+        print(f"📺 TV Control: Enabled (with smart detection)")
+        print(f"🎬 Video Playback: Enabled")
+        print(f"🎮 Universal Controls: stop, vol_up, vol_down")
         print("\nScan tag to begin... (Ctrl+C or Ctrl+Z to quit)")
         
-        # Play startup sound
         self.play_sound("info")
         
         nfc_thread = threading.Thread(target=self.start_nfc_listener)
