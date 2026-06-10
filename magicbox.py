@@ -13,8 +13,10 @@ speaker (via the `sonos` command from soco-cli), play a video on the TV
 "vol_up". Audible beeps (played through the Pi's headphone jack) give
 feedback since the box has no screen.
 
-External programs this script drives via subprocess:
-  - sonos       (soco-cli)   -> controls the Sonos speaker
+External tools this script drives:
+  - soco-cli                 -> controls the Sonos speaker (called via
+                                its Python API for speed, with the
+                                `sonos` command as fallback)
   - cec-client  (libcec)     -> talks to the TV over the HDMI cable
   - cvlc        (VLC)        -> plays videos fullscreen, no GUI
   - aplay       (ALSA)       -> plays the feedback beeps
@@ -34,6 +36,16 @@ import math         # math.sin generates the beep waveforms
 import wave         # stdlib writer for .wav files
 import shutil       # rmtree, to clean up the cached beep files on exit
 import tempfile     # gives us a throwaway directory for those beeps
+
+# soco-cli's Python API lets us run Sonos commands inside this process,
+# which is much faster than shelling out to the `sonos` command: no new
+# Python interpreter per command, and the speaker lookup is cached after
+# the first call instead of doing network discovery every time. If the
+# import fails for some reason we fall back to the `sonos` CLI.
+try:
+    from soco_cli import api as sonos_api
+except ImportError:
+    sonos_api = None
 
 
 class MagicBox:
@@ -133,19 +145,33 @@ class MagicBox:
 
         return self.sound_files[sound_type]
 
-    def play_sound(self, sound_type="success"):
-        """Play a feedback beep through the Pi's headphone jack."""
+    def play_sound(self, sound_type="success", wait=False):
+        """Play a feedback beep through the Pi's headphone jack.
+
+        By default this is fire-and-forget: aplay is started in the
+        background and we return immediately, so a beep never delays
+        the tag handling that follows it. Pass wait=True when the beep
+        must finish before moving on (only needed at shutdown, where we
+        delete the sound files right after).
+        """
         try:
             # Unknown sound names fall back to the success beep rather
             # than crashing.
             if sound_type not in self.SOUNDS:
                 sound_type = "success"
             # aplay is ALSA's command-line player; -q keeps it quiet on
-            # stdout. The timeout guards against a wedged audio device.
-            subprocess.run(['aplay', '-q', self.get_sound_file(sound_type)],
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL,
-                           timeout=5)
+            # stdout.
+            cmd = ['aplay', '-q', self.get_sound_file(sound_type)]
+            if wait:
+                # The timeout guards against a wedged audio device.
+                subprocess.run(cmd,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL,
+                               timeout=5)
+            else:
+                subprocess.Popen(cmd,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
         except Exception as e:
             # A broken beep should never take down the box — log and move on.
             self.logger.error(f"Failed to play sound: {e}")
@@ -249,9 +275,12 @@ class MagicBox:
                     self.vlc_process.kill()
                 self.vlc_process = None
 
-            # Belt and braces: kill any VLC we lost track of (e.g. left
-            # over from a previous crashed run of this script).
-            subprocess.run(['pkill', 'vlc'], capture_output=True)
+                # Belt and braces: make sure nothing VLC-related
+                # survived the kill. Only done when a video was actually
+                # playing — strays from a previous crashed run are
+                # cleaned up once at startup instead, which keeps this
+                # method fast on the music path.
+                subprocess.run(['pkill', 'vlc'], capture_output=True)
 
         except Exception as e:
             self.logger.error(f"Stop video error: {e}")
@@ -299,11 +328,29 @@ class MagicBox:
     def run_sonos_command(self, *args):
         """Run one soco-cli command against our Sonos room.
 
-        Example: run_sonos_command("volume", "30") executes the shell
-        command `sonos Kitchen volume 30`. Returns a (exit_code, stdout,
-        stderr) tuple; exit code 0 means success, anything else is an
-        error with details in stderr.
+        Example: run_sonos_command("volume", "30") does the same as the
+        shell command `sonos Kitchen volume 30`. Returns an (exit_code,
+        stdout, stderr) tuple; exit code 0 means success, anything else
+        is an error with details in stderr.
+
+        Fast path: soco-cli's Python API, called directly inside this
+        process. The first call discovers the speaker on the network
+        (slow, a second or two — which is why start() warms it up in
+        the background), every call after that reuses the cached
+        connection and takes milliseconds.
+
+        Slow path (only if the soco_cli module isn't importable): shell
+        out to the `sonos` command, which pays interpreter startup and
+        speaker discovery on every single call.
         """
+        if sonos_api is not None:
+            try:
+                code, output, error = sonos_api.run_command(self.room, *args)
+                return code, str(output).strip(), str(error).strip()
+            except Exception as e:
+                self.logger.error(f"Sonos API error on '{' '.join(args)}': {e}")
+                return 1, "", str(e)
+
         cmd = ["sonos", self.room] + list(args)
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -314,13 +361,30 @@ class MagicBox:
             self.logger.error(f"Sonos command timed out: {' '.join(args)}")
             return 1, "", "command timed out"
 
+    def warm_up_sonos(self):
+        """Resolve the Sonos speaker once, so the first card is fast.
+
+        Run in a background thread at startup: it issues a harmless
+        query (read the volume) whose only purpose is to trigger
+        speaker discovery now, while nobody is waiting, instead of on
+        the first scanned card.
+        """
+        code, _, error = self.run_sonos_command("volume")
+        if code == 0:
+            self.logger.info(f"Sonos speaker '{self.room}' found and cached")
+        else:
+            self.logger.warning(f"Sonos warm-up failed: {error}")
+
     def play_music(self, url, title=None, shuffle=False):
         """Send a streaming-service share link to the Sonos speaker."""
         try:
             # Music means the TV isn't needed: stop any video and turn
-            # the TV off.
+            # the TV off. The TV command goes to a background thread
+            # because cec-client takes several seconds to register on
+            # the HDMI bus — there's no reason the music should wait
+            # for that.
             self.stop_video()
-            self.tv_off()
+            threading.Thread(target=self.tv_off, daemon=True).start()
 
             # Start fresh: empty the speaker's queue, then hand it the
             # share link. soco-cli's play_sharelink understands public
@@ -549,9 +613,9 @@ class MagicBox:
         if self.clf:
             self.clf.close()
 
-        # Goodbye beep, then remove the cached beep files.
-        self.play_sound("info")
-        time.sleep(0.3)
+        # Goodbye beep — wait=True so the beep finishes before we
+        # delete the very file aplay is reading from.
+        self.play_sound("info", wait=True)
         shutil.rmtree(self.sound_dir, ignore_errors=True)
         sys.exit(0)
 
@@ -561,6 +625,14 @@ class MagicBox:
             print("❌ NFC setup failed")
             self.play_sound("error")
             return
+
+        # Clean up any VLC left over from a previous crashed run, once,
+        # here — so stop_video() doesn't have to do it on every card.
+        subprocess.run(['pkill', 'vlc'], capture_output=True)
+
+        # Find the Sonos speaker now, in the background, so the first
+        # scanned card doesn't pay the discovery delay.
+        threading.Thread(target=self.warm_up_sonos, daemon=True).start()
 
         # Route Ctrl+C (SIGINT) and Ctrl+Z (SIGTSTP) to our clean
         # shutdown instead of their default behavior.
