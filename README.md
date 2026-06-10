@@ -173,10 +173,10 @@ sudo apt install -y \
     libtool \
     automake \
     autoconf
-
-# Install numpy for audio feedback (optional)
-sudo apt install -y python3-numpy
 ```
+
+> Note: audio feedback beeps are generated with the Python standard
+> library — no extra packages (like numpy) are needed.
 
 #### 6. Install nfc-tools (Optional - for testing)
 
@@ -221,23 +221,18 @@ source magicbox_env/bin/activate
 pip install --upgrade pip
 
 # Install Python packages
-pip install nfcpy soco soco-cli numpy
+pip install nfcpy soco soco-cli
 ```
 
 #### 8. Install Magic Box Code
 
 ```bash
 # Still in ~/magic_box with virtual environment activated
-# Create the main script
-nano magic_box.py
-
-# Copy and paste your Magic Box code
-# (Use the "Best Version with Video" code from your documents)
-
-# Save and exit (Ctrl+O, Enter, Ctrl+X)
+# Download the script from GitHub
+wget https://raw.githubusercontent.com/simoneroux/magicbox/main/magicbox.py
 
 # Make executable
-chmod +x magic_box.py
+chmod +x magicbox.py
 ```
 
 #### 9. Create Configuration (Optional)
@@ -266,7 +261,7 @@ If you already have a Pi with Raspberry Pi OS:
 sudo apt update && sudo apt upgrade -y
 
 # Install missing packages
-sudo apt install -y python3-venv cec-utils vlc python3-numpy
+sudo apt install -y python3-venv cec-utils vlc
 
 # Enable UART in raspi-config
 sudo raspi-config
@@ -417,7 +412,7 @@ cd ~/magic_box
 source magicbox_env/bin/activate
 
 # Run Magic Box (replace "Kitchen" with your Sonos room name)
-python3 magic_box.py Kitchen
+python3 magicbox.py Kitchen
 ```
 
 You should see:
@@ -480,7 +475,7 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/magic_box
 Environment="PATH=/home/pi/magic_box/magicbox_env/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=/home/pi/magic_box/magicbox_env/bin/python3 /home/pi/magic_box/magic_box.py Kitchen
+ExecStart=/home/pi/magic_box/magicbox_env/bin/python3 /home/pi/magic_box/magicbox.py Kitchen
 Restart=always
 RestartSec=10
 
@@ -523,7 +518,10 @@ The Magic Box plays beeps through the Pi's headphone jack:
 - **Error beep**: 220 Hz, 0.3s (action failed)
 - **Info beep**: 440 Hz, 0.2s (informational)
 
-To adjust beep sounds, modify the `play_sound()` method in `magic_box.py`.
+The tones are generated with the Python standard library (no numpy
+needed) and cached as .wav files for the duration of the session. To
+adjust pitch or length, edit the `SOUNDS` table at the top of the
+`MagicBox` class in `magicbox.py`.
 
 ### TV Smart Detection
 
@@ -556,7 +554,7 @@ sudo systemctl enable magic-box-bedroom.service
 Run with verbose logging:
 
 ```bash
-# Edit magic_box.py
+# Edit magicbox.py
 # Change:
 logging.basicConfig(level=logging.INFO, ...)
 # To:
@@ -608,7 +606,7 @@ logging.basicConfig(level=logging.DEBUG, ...)
    ```
 3. Use IP address instead of room name:
    ```bash
-   python3 magic_box.py 192.168.1.50
+   python3 magicbox.py 192.168.1.50
    ```
 4. Check firewall rules (if enabled):
    ```bash
@@ -655,7 +653,7 @@ logging.basicConfig(level=logging.DEBUG, ...)
    vcgencmd get_mem gpu
    # Should be 256M or higher
    ```
-3. Increase network caching (edit magic_box.py):
+3. Increase network caching (edit magicbox.py):
    ```python
    '--network-caching=5000',  # Increase from 3000
    ```
@@ -684,9 +682,9 @@ logging.basicConfig(level=logging.DEBUG, ...)
    sudo raspi-config
    # System Options → Audio → Choose headphones
    ```
-4. Install numpy if missing:
+4. Make sure `aplay` is installed (used to play the beeps):
    ```bash
-   sudo apt install python3-numpy
+   sudo apt install alsa-utils
    ```
 
 ### Tags Not Reading
@@ -715,7 +713,7 @@ logging.basicConfig(level=logging.DEBUG, ...)
    ```bash
    cd ~/magic_box
    source magicbox_env/bin/activate
-   python3 magic_box.py Kitchen
+   python3 magicbox.py Kitchen
    ```
 3. Update dependencies:
    ```bash
