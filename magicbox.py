@@ -14,6 +14,7 @@ import tempfile
 class MagicBox:
     def __init__(self, room):
         self.room = room
+        self.speaker_ip = None  # Cached once, reused to skip per-command discovery
         self.clf = None
         self.is_running = True
         self.vlc_process = None
@@ -200,41 +201,107 @@ class MagicBox:
             self.logger.error(f"Video playback error: {e}")
             return False
 
+    def resolve_speaker_ip(self):
+        """Resolve the room name to a speaker IP once and cache it.
+
+        soco-cli re-runs a full network discovery on every `sonos <RoomName> ...`
+        call. Passing an IP address instead lets it connect directly and skip
+        discovery, so we pay that cost a single time here and reuse the result
+        for every subsequent command.
+        """
+        if self.speaker_ip:
+            return self.speaker_ip
+
+        # If the user already started us with an IP address, use it as-is.
+        if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', self.room):
+            self.speaker_ip = self.room
+            return self.speaker_ip
+
+        try:
+            import soco
+            device = soco.discovery.by_name(self.room)
+            if device is None:
+                # Fall back to a full scan and match the player name case-insensitively.
+                for candidate in (soco.discovery.discover() or []):
+                    if candidate.player_name.lower() == self.room.lower():
+                        device = candidate
+                        break
+            if device is not None:
+                self.speaker_ip = device.ip_address
+                self.logger.info(f"Resolved '{self.room}' to {self.speaker_ip}")
+        except Exception as e:
+            # Not fatal: we fall back to addressing the speaker by room name,
+            # which still works, just with per-command discovery.
+            self.logger.debug(f"Speaker IP resolution failed: {e}")
+
+        return self.speaker_ip
+
+    def _sonos_target(self):
+        """Prefer the cached IP (no discovery); fall back to the room name."""
+        return self.speaker_ip or self.room
+
     def run_sonos_command(self, *args):
-        """Execute a Sonos command via soco-cli"""
-        cmd = ["sonos", self.room] + list(args)
+        """Execute a single Sonos command via soco-cli"""
+        cmd = ["sonos", self._sonos_target()] + list(args)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+    def run_sonos_sequence(self, *commands):
+        """Execute several Sonos commands in a single soco-cli invocation.
+
+        soco-cli runs multiple commands separated by ':' in one process, so this
+        collapses N connections into one. Each element of `commands` is a tuple
+        of args, e.g. ("clear_queue",), ("play_sharelink", url).
+        """
+        target = self._sonos_target()
+        cmd = ["sonos"]
+        for i, command in enumerate(commands):
+            if i > 0:
+                cmd.append(":")
+            cmd.append(target)
+            cmd.extend(command)
         result = subprocess.run(cmd, capture_output=True, text=True)
         return result.returncode, result.stdout.strip(), result.stderr.strip()
 
     def play_music(self, url, title=None, shuffle=False):
         """Play music from a streaming service URL"""
         try:
-            # Stop any video first
-            self.stop_video()
-            
-            # Turn off TV
-            self.tv_off()
-            
-            # Clear queue and play
-            self.run_sonos_command("clear_queue")
-            code, _, stderr = self.run_sonos_command("play_sharelink", url)
-            
+            # Video stop and TV-off don't affect whether the music starts, so run
+            # them off the critical path — the play command fires immediately
+            # instead of waiting on a CEC round-trip and VLC teardown.
+            threading.Thread(target=self._pre_music_cleanup, daemon=True).start()
+
+            # Clear the queue, load the share link, and set shuffle in a SINGLE
+            # soco-cli invocation (one connection instead of three).
+            shuffle_state = "on" if shuffle else "off"
+            code, _, stderr = self.run_sonos_sequence(
+                ("clear_queue",),
+                ("play_sharelink", url),
+                ("shuffle", shuffle_state),
+            )
+
             if code == 0:
                 if shuffle:
-                    self.run_sonos_command("shuffle", "on")
                     print(f"🔀 Playing shuffled: {title or 'Music from tag'}")
                 else:
-                    self.run_sonos_command("shuffle", "off")
                     print(f"▶️ Playing: {title or 'Music from tag'}")
                 return True
             else:
                 print(f"❌ Failed: {stderr}")
                 return False
-                
+
         except Exception as e:
             self.logger.error(f"Error playing URL: {e}")
             print("❌ Failed to play music from tag")
             return False
+
+    def _pre_music_cleanup(self):
+        """Stop video playback and turn the TV off (runs off the critical path)."""
+        try:
+            self.stop_video()
+            self.tv_off()
+        except Exception as e:
+            self.logger.error(f"Pre-music cleanup error: {e}")
 
     def handle_control(self, command):
         """Handle basic playback controls - universal for both music and video"""
@@ -386,7 +453,11 @@ class MagicBox:
 
         signal.signal(signal.SIGINT, self.handle_quit)
         signal.signal(signal.SIGTSTP, self.handle_quit)
-        
+
+        # Resolve and cache the speaker IP up front so the first scan doesn't
+        # pay for discovery. Done in the background so startup isn't blocked.
+        threading.Thread(target=self.resolve_speaker_ip, daemon=True).start()
+
         print("\n✨ Magic Box Ready")
         print(f"🔈 Sonos: {self.room}")
         print(f"📺 TV Control: Enabled (with smart detection)")
