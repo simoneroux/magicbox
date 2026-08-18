@@ -873,6 +873,12 @@ class MagicBox:
         # here — so stop_video() doesn't have to do it on every card.
         subprocess.run(['pkill', 'vlc'], capture_output=True)
 
+        # Pre-generate every feedback beep now, at idle boot time, so the
+        # first card scan doesn't pay the (tiny) WAV-encode cost on the
+        # NFC thread mid-tap. Cheap insurance: ~5ms total.
+        for sound_type in self.SOUNDS:
+            self.get_sound_file(sound_type)
+
         # Find the Sonos speaker now, in the background, so the first
         # scanned card doesn't pay the discovery delay.
         threading.Thread(target=self.warm_up_sonos, daemon=True).start()
