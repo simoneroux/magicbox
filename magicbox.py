@@ -1,190 +1,322 @@
 #!/usr/bin/env python3
-import nfc
-import subprocess
+"""
+Magic Box — an NFC-powered jukebox for Raspberry Pi.
+
+How it works, in one paragraph:
+A PN532 NFC reader (connected over the Pi's serial port) waits for a tag.
+Each tag stores small "NDEF records" written with an app like NFC Tools:
+a URI record holding a streaming link, plus optional text records like
+"name:Frozen" or "mode:shuffle". When a tag is scanned, this script reads
+those records and decides what to do — send a music link to a Sonos
+speaker (via the `sonos` command from soco-cli), play a video on the TV
+(via VLC + HDMI-CEC to wake the TV), or run a control command like
+"vol_up". Audible beeps (played through the Pi's headphone jack) give
+feedback since the box has no screen.
+
+A connected mouse can also drive playback (optional): scroll wheel for
+volume, the side buttons for next/previous track, middle click to
+play/stop. This needs the `python-evdev` package; without it (or without
+a mouse) the box just runs NFC-only as before.
+
+External tools this script drives:
+  - soco-cli                 -> controls the Sonos speaker (called via
+                                its Python API for speed, with the
+                                `sonos` command as fallback)
+  - cec-client  (libcec)     -> talks to the TV over the HDMI cable
+  - cvlc        (VLC)        -> plays videos fullscreen, no GUI
+  - aplay       (ALSA)       -> plays the feedback beeps
+"""
+
+import nfc          # nfcpy: talks to the PN532 NFC reader
+import subprocess   # used to run all the external programs listed above
 import sys
-import signal
+import signal       # lets us catch Ctrl+C and shut down cleanly
 import logging
-import threading
+import threading    # the NFC listener runs in its own thread
 import time
-import re
+import re           # regex, used to recognize music streaming URLs
 import os
-import numpy as np
-import tempfile
+import array        # compact array of raw audio samples (16-bit ints)
+import math         # math.sin generates the beep waveforms
+import wave         # stdlib writer for .wav files
+import shutil       # rmtree, to clean up the cached beep files on exit
+import tempfile     # gives us a throwaway directory for those beeps
+
+# soco-cli's Python API lets us run Sonos commands inside this process,
+# which is much faster than shelling out to the `sonos` command: no new
+# Python interpreter per command, and the speaker lookup is cached after
+# the first call instead of doing network discovery every time. If the
+# import fails for some reason we fall back to the `sonos` CLI.
+try:
+    from soco_cli import api as sonos_api
+except ImportError:
+    sonos_api = None
+
 
 class MagicBox:
+    # The four feedback beeps. Higher frequency = higher pitch, so
+    # "success" is a high chirp and "error" is a low buzz. Durations are
+    # in seconds. These are turned into real .wav files on first use
+    # (see get_sound_file).
+    SOUNDS = {
+        "success": {"freq": 880, "duration": 0.2},
+        "error": {"freq": 220, "duration": 0.3},
+        "info": {"freq": 440, "duration": 0.2},
+        "scan": {"freq": 660, "duration": 0.1}
+    }
+
     def __init__(self, room):
+        # Name of the Sonos room/speaker to control, e.g. "Kitchen".
+        # Passed to every `sonos` command.
         self.room = room
+
+        # The NFC reader object (nfcpy ContactlessFrontend). Stays None
+        # until setup_nfc() manages to open the device.
         self.clf = None
+
+        # Main-loop flag. Both the main thread and the NFC listener
+        # thread keep going while this is True; handle_quit() flips it.
         self.is_running = True
+
+        # Handle to the currently running VLC process (subprocess.Popen),
+        # or None when no video is playing. Kept so stop_video() can
+        # terminate it later.
         self.vlc_process = None
-        
+
+        # Temp directory where generated beep .wav files are cached, and
+        # the cache itself: sound name -> file path. Generating each tone
+        # once and reusing the file keeps scan feedback snappy on a Pi.
+        self.sound_dir = tempfile.mkdtemp(prefix='magicbox-')
+        self.sound_files = {}
+
+        # Optional mouse control. mouse_device is the evdev device once
+        # setup_mouse() finds one; is_playing is a best-effort flag so
+        # the middle-click button can toggle between play and stop.
+        self.mouse_device = None
+        self.is_playing = False
+
+        # Every control command a tag (or a mouse button) can trigger,
+        # defined once here. Two kinds of values:
+        #   - a tuple ("sonos-subcommand", "message to print") for simple
+        #     Sonos commands, executed by handle_control()
+        #   - a callable (method or lambda) for anything more involved
+        # on_connect() also uses the keys of this dict to check whether
+        # a scanned text record is a valid command.
+        self.commands = {
+            "play": ("play", "▶️ Playing"),
+            "stop": lambda: (self.stop_video(), self.run_sonos_command("stop")),
+            "next": ("next", "⏭️ Next track"),
+            "prev": ("previous", "⏮️ Previous track"),
+            "vol_up": lambda: self.adjust_volume(5),
+            "vol_down": lambda: self.adjust_volume(-5),
+            "tv_on": self.tv_on,
+            "tv_off": self.tv_off
+        }
+
+        # Errors go through the logger (with timestamps); normal user
+        # feedback uses plain print() with emoji.
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger(__name__)
 
-    def play_sound(self, sound_type="success"):
-        """Play a feedback sound through the Raspberry Pi headphone jack"""
-        try:
-            sounds = {
-                "success": {"freq": 880, "duration": 0.2},
-                "error": {"freq": 220, "duration": 0.3},
-                "info": {"freq": 440, "duration": 0.2},
-                "scan": {"freq": 660, "duration": 0.1}
-            }
-            
-            config = sounds.get(sound_type, sounds["success"])
+    # ------------------------------------------------------------------
+    # Feedback beeps
+    # ------------------------------------------------------------------
+
+    def get_sound_file(self, sound_type):
+        """Return the path to the .wav file for a beep, generating it on
+        first use and caching it for the rest of the session."""
+        if sound_type not in self.sound_files:
+            config = self.SOUNDS[sound_type]
             freq = config["freq"]
             duration = config["duration"]
-            sample_rate = 22050
-            amplitude = 0.5
-            
-            t = np.linspace(0, duration, int(sample_rate * duration), False)
-            tone = np.sin(2 * np.pi * freq * t) * amplitude
-            audio = (tone * 32767).astype(np.int16)
-            
-            fd, temp_file = tempfile.mkstemp(suffix='.wav')
-            os.close(fd)
-            
-            with open(temp_file, 'wb') as f:
-                f.write(b'RIFF')
-                f.write((36 + len(audio) * 2).to_bytes(4, 'little'))
-                f.write(b'WAVE')
-                f.write(b'fmt ')
-                f.write((16).to_bytes(4, 'little'))
-                f.write((1).to_bytes(2, 'little'))
-                f.write((1).to_bytes(2, 'little'))
-                f.write((sample_rate).to_bytes(4, 'little'))
-                f.write((sample_rate * 2).to_bytes(4, 'little'))
-                f.write((2).to_bytes(2, 'little'))
-                f.write((16).to_bytes(2, 'little'))
-                f.write(b'data')
-                f.write((len(audio) * 2).to_bytes(4, 'little'))
-                f.write(audio.tobytes())
-            
-            subprocess.run(['aplay', '-q', temp_file], 
-                           stdout=subprocess.DEVNULL, 
-                           stderr=subprocess.DEVNULL)
-            os.unlink(temp_file)
-            
+            sample_rate = 22050   # samples per second; plenty for a beep
+            amplitude = 0.5       # half of maximum volume, easy on the ears
+
+            # Build the waveform sample by sample. Each sample is the
+            # sine wave's height at that instant, scaled to a signed
+            # 16-bit integer (range -32767..32767), which is the format
+            # WAV files expect. 'h' = array of 16-bit signed ints.
+            audio = array.array('h', (
+                int(amplitude * 32767 * math.sin(2 * math.pi * freq * i / sample_rate))
+                for i in range(int(sample_rate * duration))
+            ))
+
+            # Wrap the raw samples in a proper WAV file: 1 channel
+            # (mono), 2 bytes per sample (16-bit), at our sample rate.
+            path = os.path.join(self.sound_dir, f'{sound_type}.wav')
+            with wave.open(path, 'wb') as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(sample_rate)
+                wav.writeframes(audio.tobytes())
+            self.sound_files[sound_type] = path
+
+        return self.sound_files[sound_type]
+
+    def play_sound(self, sound_type="success", wait=False):
+        """Play a feedback beep through the Pi's headphone jack.
+
+        By default this is fire-and-forget: aplay is started in the
+        background and we return immediately, so a beep never delays
+        the tag handling that follows it. Pass wait=True when the beep
+        must finish before moving on (only needed at shutdown, where we
+        delete the sound files right after).
+        """
+        try:
+            # Unknown sound names fall back to the success beep rather
+            # than crashing.
+            if sound_type not in self.SOUNDS:
+                sound_type = "success"
+            # aplay is ALSA's command-line player; -q keeps it quiet on
+            # stdout.
+            cmd = ['aplay', '-q', self.get_sound_file(sound_type)]
+            if wait:
+                # The timeout guards against a wedged audio device.
+                subprocess.run(cmd,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL,
+                               timeout=5)
+            else:
+                subprocess.Popen(cmd,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
         except Exception as e:
+            # A broken beep should never take down the box — log and move on.
             self.logger.error(f"Failed to play sound: {e}")
 
+    # ------------------------------------------------------------------
+    # TV control over HDMI-CEC
+    # ------------------------------------------------------------------
+
+    def run_cec_command(self, command):
+        """Send one command to the TV over HDMI-CEC.
+
+        CEC is a protocol that runs over a wire inside the HDMI cable and
+        lets devices control each other. cec-client's flags: -s means
+        "single command" mode (send and exit), -d 1 limits log output to
+        errors. The command itself is fed in on stdin. Commands used here:
+          'pow 0'     -> ask device 0 (the TV) for its power status
+          'on 0'      -> turn the TV on
+          'standby 0' -> put the TV in standby (off)
+          'as'        -> "active source": make the Pi the displayed input
+        """
+        return subprocess.run(
+            ['cec-client', '-s', '-d', '1'],
+            input=command + '\n',
+            capture_output=True,
+            text=True,      # send/receive strings instead of bytes
+            timeout=20      # don't hang forever if the CEC bus is stuck
+        )
+
     def is_tv_on(self):
-        """Check if TV is already on"""
+        """Ask the TV for its power status; True if it reports 'on'."""
         try:
-            result = subprocess.run(
-                ['cec-client', '-s', '-d', '1'],
-                input='pow 0\n',  # Changed from b'pow 0\n' to regular string
-                capture_output=True,
-                text=True  # This tells subprocess to handle text encoding
-            )
-            # Check if response contains "power status: on"
+            result = self.run_cec_command('pow 0')
+            # cec-client prints something like "power status: on" —
+            # we just look for that phrase in its output.
             return 'power status: on' in result.stdout.lower()
         except Exception as e:
             self.logger.error(f"TV status check error: {e}")
+            # If we can't tell, assume off — worst case we send a
+            # harmless extra power-on command.
             return False
 
     def tv_on(self):
-        """Turn on TV and switch to Pi input - optimized with status check"""
+        """Turn on the TV and switch it to the Pi's HDMI input.
+
+        Checks the current power state first: if the TV is already on we
+        skip the power-on command and its 3-second warm-up wait, so
+        back-to-back video cards start faster.
+        """
         try:
-            # Check if TV is already on
             if self.is_tv_on():
                 print("📺 TV already on, switching input...")
-                # Just switch input
-                subprocess.run(
-                    ['cec-client', '-s', '-d', '1'],
-                    input='as\n',  # Changed from b'as\n'
-                    capture_output=True,
-                    text=True
-                )
-                time.sleep(1)  # Short wait for input switch
+                self.run_cec_command('as')
+                time.sleep(1)  # give the TV a moment to switch inputs
                 print("✅ TV ready")
                 return True
-            
-            # TV is off, need to turn it on
+
+            # TV is off: power it on, wait for it to boot enough to
+            # accept the input-switch command, then switch.
             print("📺 Turning on TV...")
-            
-            # Turn on
-            subprocess.run(
-                ['cec-client', '-s', '-d', '1'],
-                input='on 0\n',  # Changed from b'on 0\n'
-                capture_output=True,
-                text=True
-            )
-            
-            # Reduced wait from 4 to 3 seconds
+            self.run_cec_command('on 0')
+
             print("📺 Waiting 3 seconds...")
             time.sleep(3)
-            
-            # Switch input
+
             print("📺 Switching to Pi input...")
-            subprocess.run(
-                ['cec-client', '-s', '-d', '1'],
-                input='as\n',  # Changed from b'as\n'
-                capture_output=True,
-                text=True
-            )
-            
-            # Reduced wait from 2 to 1 second
+            self.run_cec_command('as')
             time.sleep(1)
-            
+
             print("✅ TV ready")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"TV on error: {e}")
             return False
 
     def tv_off(self):
-        """Turn off TV"""
+        """Put the TV into standby."""
         try:
             print("📺 Turning off TV...")
-            subprocess.run(
-                ['cec-client', '-s', '-d', '1'],
-                input='standby 0\n',  # Changed from b'standby 0\n'
-                capture_output=True,
-                text=True
-            )
+            self.run_cec_command('standby 0')
             return True
         except Exception as e:
             self.logger.error(f"TV off error: {e}")
             return False
 
+    # ------------------------------------------------------------------
+    # Video playback (VLC)
+    # ------------------------------------------------------------------
+
     def stop_video(self):
-        """Stop any running video"""
+        """Stop any running video."""
         try:
             if self.vlc_process:
                 print("⏹️ Stopping video...")
+                # terminate() asks politely (SIGTERM); if VLC hasn't
+                # exited after 2 seconds, kill() forces it (SIGKILL).
                 self.vlc_process.terminate()
                 try:
                     self.vlc_process.wait(timeout=2)
-                except:
+                except subprocess.TimeoutExpired:
                     self.vlc_process.kill()
                 self.vlc_process = None
-            
-            # Also kill any stray VLC processes
-            subprocess.run(['pkill', 'vlc'], capture_output=True)
-            
+
+                # Belt and braces: make sure nothing VLC-related
+                # survived the kill. Only done when a video was actually
+                # playing — strays from a previous crashed run are
+                # cleaned up once at startup instead, which keeps this
+                # method fast on the music path.
+                subprocess.run(['pkill', 'vlc'], capture_output=True)
+
         except Exception as e:
             self.logger.error(f"Stop video error: {e}")
 
     def play_video(self, url, title=None):
-        """Play video from URL (Jellyfin, etc) - NON-BLOCKING"""
+        """Play a video URL (e.g. a Jellyfin stream) fullscreen on the TV.
+
+        Non-blocking: VLC is started with Popen and left running in the
+        background, so the box immediately goes back to listening for
+        the next tag (which is how "stop" cards can interrupt a video).
+        """
         try:
             print(f"🎬 Playing video: {title or url}")
-            
-            # Stop any current video
+
+            # Only one thing should play at a time: stop any current
+            # video and any Sonos music, then make sure the TV is on
+            # and showing the Pi.
             self.stop_video()
-            
-            # Stop any music
             self.run_sonos_command("stop")
-            
-            # Turn on TV and switch input (optimized)
             self.tv_on()
-            
-            # Start video in background
+
+            # cvlc = VLC without its GUI. --network-caching=3000 buffers
+            # 3 seconds of stream to ride out Wi-Fi hiccups, and
+            # --play-and-exit makes VLC quit when the video ends instead
+            # of sitting on a black screen.
             self.vlc_process = subprocess.Popen([
                 'cvlc',
                 '--fullscreen',
@@ -192,34 +324,95 @@ class MagicBox:
                 '--play-and-exit',
                 url
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
+
+            # Something is now playing, so a middle-click should stop it.
+            self.is_playing = True
+
             print("✅ Video playing (scan another card to control)")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"Video playback error: {e}")
             return False
 
+    # ------------------------------------------------------------------
+    # Music playback (Sonos via soco-cli)
+    # ------------------------------------------------------------------
+
     def run_sonos_command(self, *args):
-        """Execute a Sonos command via soco-cli"""
+        """Run one soco-cli command against our Sonos room.
+
+        Example: run_sonos_command("volume", "30") does the same as the
+        shell command `sonos Kitchen volume 30`. Returns an (exit_code,
+        stdout, stderr) tuple; exit code 0 means success, anything else
+        is an error with details in stderr.
+
+        Fast path: soco-cli's Python API, called directly inside this
+        process. The first call discovers the speaker on the network
+        (slow, a second or two — which is why start() warms it up in
+        the background), every call after that reuses the cached
+        connection and takes milliseconds.
+
+        Slow path (only if the soco_cli module isn't importable): shell
+        out to the `sonos` command, which pays interpreter startup and
+        speaker discovery on every single call.
+        """
+        if sonos_api is not None:
+            try:
+                code, output, error = sonos_api.run_command(self.room, *args)
+                return code, str(output).strip(), str(error).strip()
+            except Exception as e:
+                self.logger.error(f"Sonos API error on '{' '.join(args)}': {e}")
+                return 1, "", str(e)
+
         cmd = ["sonos", self.room] + list(args)
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        return result.returncode, result.stdout.strip(), result.stderr.strip()
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            return result.returncode, result.stdout.strip(), result.stderr.strip()
+        except subprocess.TimeoutExpired:
+            # An unreachable speaker shouldn't freeze the whole box;
+            # report it like any other failed command.
+            self.logger.error(f"Sonos command timed out: {' '.join(args)}")
+            return 1, "", "command timed out"
+
+    def warm_up_sonos(self):
+        """Resolve the Sonos speaker once, so the first card is fast.
+
+        Run in a background thread at startup: it issues a harmless
+        query (read the volume) whose only purpose is to trigger
+        speaker discovery now, while nobody is waiting, instead of on
+        the first scanned card.
+        """
+        code, _, error = self.run_sonos_command("volume")
+        if code == 0:
+            self.logger.info(f"Sonos speaker '{self.room}' found and cached")
+        else:
+            self.logger.warning(f"Sonos warm-up failed: {error}")
 
     def play_music(self, url, title=None, shuffle=False):
-        """Play music from a streaming service URL"""
+        """Send a streaming-service share link to the Sonos speaker."""
         try:
-            # Stop any video first
+            # Music means the TV isn't needed: stop any video and turn
+            # the TV off. The TV command goes to a background thread
+            # because cec-client takes several seconds to register on
+            # the HDMI bus — there's no reason the music should wait
+            # for that.
             self.stop_video()
-            
-            # Turn off TV
-            self.tv_off()
-            
-            # Clear queue and play
+            threading.Thread(target=self.tv_off, daemon=True).start()
+
+            # Start fresh: empty the speaker's queue, then hand it the
+            # share link. soco-cli's play_sharelink understands public
+            # Spotify/Apple Music/Tidal/Deezer URLs and queues their
+            # contents (a track, album, or playlist).
             self.run_sonos_command("clear_queue")
             code, _, stderr = self.run_sonos_command("play_sharelink", url)
-            
+
             if code == 0:
+                # Something is now playing, so a middle-click should stop it.
+                self.is_playing = True
+                # Shuffle is a speaker-level toggle that would otherwise
+                # persist from the previous card, so set it explicitly
+                # either way.
                 if shuffle:
                     self.run_sonos_command("shuffle", "on")
                     print(f"🔀 Playing shuffled: {title or 'Music from tag'}")
@@ -230,103 +423,152 @@ class MagicBox:
             else:
                 print(f"❌ Failed: {stderr}")
                 return False
-                
+
         except Exception as e:
             self.logger.error(f"Error playing URL: {e}")
             print("❌ Failed to play music from tag")
             return False
 
-    def handle_control(self, command):
-        """Handle basic playback controls - universal for both music and video"""
-        commands = {
-            "play": ("play", "▶️ Playing"),
-            "stop": lambda: (self.stop_video(), self.run_sonos_command("stop")),
-            "next": ("next", "⏭️ Next track"),
-            "prev": ("previous", "⏮️ Previous track"),
-            "vol_up": lambda: self.adjust_volume(5),
-            "vol_down": lambda: self.adjust_volume(-5),
-            "tv_on": lambda: self.tv_on(),
-            "tv_off": lambda: self.tv_off()
-        }
+    # ------------------------------------------------------------------
+    # Control commands (the self.commands table)
+    # ------------------------------------------------------------------
 
-        if command not in commands:
+    def handle_control(self, command):
+        """Run one control command from the self.commands table.
+
+        Works for both music and video: e.g. "stop" halts VLC and the
+        Sonos speaker at the same time. Returns True on success.
+        """
+        if command not in self.commands:
             self.play_sound("error")
             return False
 
-        action = commands[command]
+        # Keep the middle-click toggle roughly in sync with reality.
+        if command == "play":
+            self.is_playing = True
+        elif command == "stop":
+            self.is_playing = False
+
+        action = self.commands[command]
+
+        # Callable entries (lambdas/methods) just get called; they
+        # handle their own logic and printing.
         if callable(action):
             action()
             self.play_sound("success")
             print(f"✅ {command}")
-        else:
-            code, _, stderr = self.run_sonos_command(action[0])
-            self.play_sound("success" if code == 0 else "error")
-            print(action[1] if code == 0 else f"❌ Failed: {stderr}")
+            return True
+
+        # Tuple entries are (sonos subcommand, success message).
+        code, _, stderr = self.run_sonos_command(action[0])
+        self.play_sound("success" if code == 0 else "error")
+        print(action[1] if code == 0 else f"❌ Failed: {stderr}")
+        return code == 0
 
     def adjust_volume(self, delta):
-        """Adjust volume up or down by delta - universal control"""
+        """Change Sonos volume by delta (e.g. +5 or -5), capped at 60.
+
+        Sonos has no relative-volume command, so we read the current
+        level, add the delta, and write the result back.
+        """
         code, volume, _ = self.run_sonos_command("volume")
-        if code == 0:
+        if code != 0:
+            return
+        try:
             current = int(volume)
-            new_volume = max(0, min(60, current + delta))
-            self.run_sonos_command("volume", str(new_volume))
-            print(f"{'🔊' if delta > 0 else '🔉'} {new_volume}%")
+        except ValueError:
+            # soco-cli printed something unexpected; better to do
+            # nothing than to set a wild volume.
+            self.logger.error(f"Unexpected volume output: {volume!r}")
+            return
+        # Clamp between 0 and 60 — the ceiling protects ears and
+        # neighbours from a misbehaving delta.
+        new_volume = max(0, min(60, current + delta))
+        self.run_sonos_command("volume", str(new_volume))
+        print(f"{'🔊' if delta > 0 else '🔉'} {new_volume}%")
+
+    # ------------------------------------------------------------------
+    # NFC: reading tags and deciding what to do
+    # ------------------------------------------------------------------
 
     def on_connect(self, tag):
-        """Handle NFC tag connection"""
+        """Called by nfcpy every time a tag touches the reader.
+
+        This is the heart of the box. A tag carries NDEF records of two
+        kinds we care about:
+          - text records ("urn:nfc:wkt:T"), used two ways:
+              with a colon  -> metadata: "name:Frozen", "mode:shuffle",
+                               "type:video"
+              without colon -> a control command: "stop", "vol_up", ...
+          - one URI record ("urn:nfc:wkt:U") holding the content link
+
+        Returning True tells nfcpy we're done with this tag and it can
+        go back to waiting for the next one.
+        """
         try:
+            # Immediate beep so you know the scan registered, even
+            # before we've figured out what the tag wants.
             self.play_sound("scan")
-            
+
+            # NDEF is the standard format for data on NFC tags; a tag
+            # without it (blank card, bank card...) is no use to us.
             if not tag.ndef:
                 print("❌ Not a valid NDEF tag")
                 self.play_sound("error")
                 return True
-                
-            # Track card settings
-            card_name = None
-            content_type = None
-            shuffle = False
-            url = None
-                
-            # Parse tag
+
+            # What we hope to learn from the records:
+            card_name = None      # display name, from "name:..."
+            content_type = None   # "video" forces VLC, from "type:..."
+            shuffle = False       # from "mode:shuffle"
+            url = None            # the content link, from the URI record
+
+            # Pass 1: collect metadata and the URL from all records.
             for record in tag.ndef.records:
                 if record.type == "urn:nfc:wkt:T":
                     if ":" in record.text:
-                        identifier, content = record.text.lower().split(":", 1)
+                        # Split "name:Frozen" into "name" and "Frozen".
+                        # Only the identifier is lowercased — the
+                        # content keeps its capitalization for display.
+                        identifier, content = record.text.split(":", 1)
+                        identifier = identifier.lower()
                         if identifier == "name":
-                            card_name = record.text.split(":", 1)[1]
+                            card_name = content
                             print(f"\n💳 Card: {card_name}")
-                        elif identifier == "mode" and content == "shuffle":
+                        elif identifier == "mode" and content.lower() == "shuffle":
                             shuffle = True
                         elif identifier == "type":
-                            content_type = content
-                            
+                            content_type = content.lower()
+
                 elif record.type == "urn:nfc:wkt:U":
                     url = record.uri
-            
-            # Handle different content types
+
+            # Decide what kind of card this is, in priority order:
+
+            # 1. Explicitly marked as video -> VLC on the TV.
             if content_type == "video" and url:
-                # Play video (Jellyfin, direct URLs)
                 result = self.play_video(url, card_name)
                 self.play_sound("success" if result else "error")
                 return True
-                
+
+            # 2. A link from a known streaming service -> Sonos.
             elif url and re.match(r'^https?://(open\.spotify\.com|music\.apple\.com|tidal\.com|www\.deezer\.com)/', url):
-                # Play music
                 result = self.play_music(url, card_name, shuffle)
                 self.play_sound("success" if result else "error")
                 return True
-                
+
+            # 3. No URL at all -> maybe it's a control card. Look for a
+            #    plain text record (no colon) matching a known command.
             elif not url:
-                # Handle control commands (universal for music and video)
                 for record in tag.ndef.records:
                     if record.type == "urn:nfc:wkt:T" and ":" not in record.text:
                         command = record.text.lower()
-                        valid_commands = ["play", "stop", "next", "prev", "vol_up", "vol_down", "tv_on", "tv_off"]
-                        if command in valid_commands:
+                        if command in self.commands:
                             self.handle_control(command)
                             return True
-            
+
+            # Nothing matched: unknown URL scheme, or a tag with
+            # records we don't understand.
             print("❌ No supported content found on tag")
             self.play_sound("error")
             return True
@@ -337,7 +579,12 @@ class MagicBox:
             return False
 
     def setup_nfc(self):
-        """Initialize NFC reader"""
+        """Open the PN532 NFC reader on the Pi's serial port.
+
+        The device path differs between Pi models/configs (ttyS0 is the
+        mini UART, ttyAMA0 the full UART), so try both and keep the
+        first one that answers.
+        """
         try:
             for path in ['tty:ttyS0:pn532', 'tty:ttyAMA0:pn532']:
                 try:
@@ -352,7 +599,13 @@ class MagicBox:
             return False
 
     def start_nfc_listener(self):
-        """Start NFC tag listener loop"""
+        """Endless scan loop; runs in a background thread.
+
+        clf.connect() blocks until a tag is presented, calls on_connect
+        with it, then returns — so we loop to wait for the next tag.
+        If the reader hiccups, wait a second and try again rather than
+        letting the thread die.
+        """
         while self.is_running:
             try:
                 self.clf.connect(rdwr={'on-connect': self.on_connect})
@@ -360,57 +613,193 @@ class MagicBox:
                 self.logger.error(f"NFC error: {e}")
                 time.sleep(1)
 
+    # ------------------------------------------------------------------
+    # Mouse control (optional)
+    # ------------------------------------------------------------------
+
+    def setup_mouse(self):
+        """Find a connected mouse to use for playback control.
+
+        Optional: uses python-evdev. If evdev isn't installed or no
+        mouse is present, mouse control is simply disabled and the NFC
+        reader keeps working exactly as before. Returns True if a mouse
+        was found.
+        """
+        try:
+            import evdev
+        except ImportError:
+            self.logger.info("python-evdev not installed; mouse control disabled")
+            return False
+
+        try:
+            self.mouse_device = self._find_mouse_device(evdev)
+        except Exception as e:
+            self.logger.error(f"Mouse detection error: {e}")
+            return False
+
+        if self.mouse_device:
+            self.logger.info(f"Mouse control enabled: {self.mouse_device.name}")
+            return True
+
+        self.logger.info("No mouse found; mouse control disabled")
+        return False
+
+    def _find_mouse_device(self, evdev):
+        """Return the first input device that looks like a mouse, or None.
+
+        A mouse is anything that reports a scroll wheel (REL_WHEEL) or
+        mouse buttons (BTN_MOUSE) in its capabilities. Reading
+        /dev/input requires membership in the 'input' group.
+        """
+        from evdev import ecodes
+        for path in evdev.list_devices():
+            try:
+                dev = evdev.InputDevice(path)
+            except Exception:
+                # Skip devices we can't open (permissions, disappeared).
+                continue
+            caps = dev.capabilities()
+            rel_axes = caps.get(ecodes.EV_REL, [])
+            keys = caps.get(ecodes.EV_KEY, [])
+            if ecodes.REL_WHEEL in rel_axes or ecodes.BTN_MOUSE in keys:
+                return dev
+        return None
+
+    def _toggle_play_stop(self):
+        """Middle-click: stop if we think we're playing, else resume."""
+        self.handle_control("stop" if self.is_playing else "play")
+
+    def start_mouse_listener(self):
+        """Map mouse events to playback controls; runs in its own thread.
+
+        Scroll wheel  -> volume up/down
+        Side buttons  -> next / previous track
+        Middle click  -> play/stop toggle
+
+        We reuse the same handle_control() commands the NFC cards use,
+        so mouse and tag controls behave identically (same beeps, same
+        messages).
+        """
+        from evdev import ecodes
+        try:
+            for event in self.mouse_device.read_loop():
+                if not self.is_running:
+                    break
+
+                # Scroll wheel: one notch up or down per event.
+                if event.type == ecodes.EV_REL and event.code == ecodes.REL_WHEEL:
+                    if event.value > 0:
+                        self.handle_control("vol_up")
+                    elif event.value < 0:
+                        self.handle_control("vol_down")
+
+                # Buttons: act on the press (value == 1) only, so we
+                # ignore the release event and any auto-repeat.
+                elif event.type == ecodes.EV_KEY and event.value == 1:
+                    if event.code in (ecodes.BTN_FORWARD, ecodes.BTN_EXTRA):
+                        self.handle_control("next")
+                    elif event.code in (ecodes.BTN_BACK, ecodes.BTN_SIDE):
+                        self.handle_control("prev")
+                    elif event.code == ecodes.BTN_MIDDLE:
+                        self._toggle_play_stop()
+
+        except Exception as e:
+            # A mouse unplug or read error shouldn't crash the box; the
+            # NFC reader keeps working.
+            self.logger.error(f"Mouse listener error: {e}")
+
+    # ------------------------------------------------------------------
+    # Startup and shutdown
+    # ------------------------------------------------------------------
+
     def handle_quit(self, signum, frame):
-        """Clean shutdown on Ctrl+C/Z"""
+        """Clean shutdown, triggered by Ctrl+C or Ctrl+Z.
+
+        signum/frame are passed by Python's signal machinery; we don't
+        need them, but the signature is required for a signal handler.
+        """
         print("\n👋 Shutting down Magic Box...")
         self.is_running = False
-        
-        # Stop everything
+
+        # Leave the room quiet and dark: stop video, stop music, TV off.
         self.stop_video()
         self.run_sonos_command("stop")
         self.tv_off()
-        
+
+        # Release the NFC reader so the next run can open it.
         if self.clf:
             self.clf.close()
-        
-        self.play_sound("info")
-        time.sleep(0.3)
+
+        # Goodbye beep — wait=True so the beep finishes before we
+        # delete the very file aplay is reading from.
+        self.play_sound("info", wait=True)
+        shutil.rmtree(self.sound_dir, ignore_errors=True)
         sys.exit(0)
 
     def start(self):
-        """Start the Magic Box"""
+        """Wire everything up and run until interrupted."""
         if not self.setup_nfc():
             print("❌ NFC setup failed")
             self.play_sound("error")
             return
 
+        # Clean up any VLC left over from a previous crashed run, once,
+        # here — so stop_video() doesn't have to do it on every card.
+        subprocess.run(['pkill', 'vlc'], capture_output=True)
+
+        # Find the Sonos speaker now, in the background, so the first
+        # scanned card doesn't pay the discovery delay.
+        threading.Thread(target=self.warm_up_sonos, daemon=True).start()
+
+        # Optional: find a mouse for playback control (scroll = volume,
+        # side buttons = track, middle = play/stop).
+        mouse_enabled = self.setup_mouse()
+
+        # Route Ctrl+C (SIGINT) and Ctrl+Z (SIGTSTP) to our clean
+        # shutdown instead of their default behavior.
         signal.signal(signal.SIGINT, self.handle_quit)
         signal.signal(signal.SIGTSTP, self.handle_quit)
-        
+
         print("\n✨ Magic Box Ready")
         print(f"🔈 Sonos: {self.room}")
         print(f"📺 TV Control: Enabled (with smart detection)")
         print(f"🎬 Video Playback: Enabled")
         print(f"🎮 Universal Controls: stop, vol_up, vol_down")
+        if mouse_enabled:
+            print(f"🖱️  Mouse: scroll=volume, side buttons=track, middle=play/stop")
         print("\nScan tag to begin... (Ctrl+C or Ctrl+Z to quit)")
-        
+
         self.play_sound("info")
-        
+
+        # The scan loop runs in a daemon thread; "daemon" means Python
+        # won't wait for it when the process exits.
         nfc_thread = threading.Thread(target=self.start_nfc_listener)
         nfc_thread.daemon = True
         nfc_thread.start()
-        
+
+        # The mouse listener also runs in its own daemon thread, when a
+        # mouse was found.
+        if mouse_enabled:
+            mouse_thread = threading.Thread(target=self.start_mouse_listener)
+            mouse_thread.daemon = True
+            mouse_thread.start()
+
+        # The main thread just idles, staying alive to receive signals
+        # (signal handlers only run on the main thread in Python).
         while self.is_running:
             time.sleep(1)
 
+
 def main():
+    # Exactly one argument expected: the Sonos room name.
     if len(sys.argv) != 2:
-        print("Usage: python3 magic_box.py ROOM_NAME")
-        print("Example: python3 magic_box.py Kitchen")
+        print("Usage: python3 magicbox.py ROOM_NAME")
+        print("Example: python3 magicbox.py Kitchen")
         sys.exit(1)
 
     box = MagicBox(sys.argv[1])
     box.start()
+
 
 if __name__ == "__main__":
     main()

@@ -222,6 +222,9 @@ pip install --upgrade pip
 
 # Install Python packages
 pip install nfcpy soco soco-cli numpy
+
+# Optional: mouse control (scroll = volume, side buttons = track)
+pip install evdev
 ```
 
 #### 8. Install Magic Box Code
@@ -524,6 +527,34 @@ The Magic Box plays beeps through the Pi's headphone jack:
 - **Info beep**: 440 Hz, 0.2s (informational)
 
 To adjust beep sounds, modify the `play_sound()` method in `magic_box.py`.
+
+### Mouse Control (Optional)
+
+If a USB (or Bluetooth) mouse is connected, the Magic Box uses it for playback
+control alongside NFC tags:
+
+- **Scroll wheel up / down** → volume up / down
+- **Side buttons** (forward / back) → next / previous track
+- **Middle click** → play / stop toggle
+
+This is enabled automatically when a mouse is detected — no configuration
+needed. It relies on the `python-evdev` package:
+
+```bash
+source ~/magic_box/magicbox_env/bin/activate
+pip install evdev
+```
+
+Reading mouse events requires access to `/dev/input`. Add your user to the
+`input` group (the `pi` user usually already is):
+
+```bash
+sudo usermod -a -G input pi
+# Log out and back in (or reboot) for the group change to take effect
+```
+
+If `evdev` isn't installed, no mouse is connected, or the user lacks `/dev/input`
+access, mouse control is silently skipped and the NFC reader works as normal.
 
 ### TV Smart Detection
 
