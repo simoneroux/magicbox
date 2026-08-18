@@ -4,11 +4,12 @@ This documents how the Magic Box is **actually deployed**, as opposed to the
 generic instructions in the README. If something here disagrees with the
 README, this file reflects reality on the running device.
 
-> ⚠️ **Heads-up: the repo and the Pi have diverged.** The `magicbox.py` in this
-> repository and the `~/magicbox/magicbox.py` running on the Pi are **not the
-> same file** — the deployed version is more advanced (background Sonos warm-up,
-> a tone cache with `play_sound(..., wait=...)`, in-process soco-cli, a 20 s
-> timeout on CEC calls). Reconciling the two is tracked as an open item below.
+> ✅ **Repo and Pi are now reconciled.** As of the mouse-control change, the
+> repo's `magicbox.py` is the deployed version (background Sonos warm-up, tone
+> cache with `play_sound(..., wait=...)`, in-process soco-cli, 20 s CEC timeout)
+> **plus** optional mouse control. Deploy by copying the repo's `magicbox.py`
+> onto the Pi (see "Deploying an update" below). The Pi remains the source of
+> truth for anything not yet committed.
 
 ## Host
 
@@ -99,6 +100,39 @@ directly:
 sudo systemctl restart magicbox.service
 ```
 
+## Deploying an update
+
+The service runs `/home/sroux/magicbox/magicbox.py`. To ship a new version from
+this repo onto the Pi:
+
+```bash
+# On the Pi, in the project dir, back up the current file first:
+cd /home/sroux/magicbox
+cp magicbox.py magicbox.py.bak
+
+# Pull the new magicbox.py in (git pull, scp, or paste), then restart:
+sudo systemctl restart magicbox.service
+
+# Watch the app come up (output is in the screen session, not the journal):
+sudo -u sroux screen -r magicbox
+#   detach with Ctrl+A then d
+```
+
+### Mouse control
+
+Mouse control is optional and auto-enabled when a mouse is detected. It needs
+the `evdev` package in the service venv, and the service user in the `input`
+group:
+
+```bash
+/home/sroux/magicbox/magicbox_env/bin/pip install evdev   # already installed (1.9.3)
+groups sroux                                               # confirm 'input' is present
+# if not: sudo usermod -a -G input sroux   (then restart the service)
+```
+
+On startup you'll see `Mouse control enabled: <name>` in the screen session.
+Mappings: scroll wheel = volume, side buttons = next/previous, middle = play/stop.
+
 ## Known issues
 
 - **CEC hangs for 20 s on TV-off.** `cec-client` times out
@@ -108,10 +142,11 @@ sudo systemctl restart magicbox.service
 
 ## Open items
 
-- [ ] Reconcile the deployed `~/magicbox/magicbox.py` with the repo (they have
-      diverged; the Pi's copy is the source of truth for what actually runs).
+- [x] Reconcile the deployed `~/magicbox/magicbox.py` with the repo — the repo's
+      `magicbox.py` now matches the deployed version plus mouse control.
+- [x] Mouse hardware verified: `Logitech Wireless Mouse` on `/dev/input/event3`,
+      `evdev` 1.9.3 in the venv, `sroux` can read the device. Remaining step is
+      to deploy the new `magicbox.py` (above) and restart.
 - [ ] Confirm the purpose of `fast_magicbox.py`, `legacy_magicbox.py`,
-      `dnlafinder.py`, and `start.sh`.
-- [ ] Investigate the CEC 20 s timeout.
-- [ ] Mouse controls: verify OS-level mouse detection and get mouse-control code
-      onto the deployed script (see repo commit `070afe7`).
+      `dnlafinder.py`, and `start.sh` (none are in the repo yet).
+- [ ] Investigate the CEC 20 s timeout on TV-off.
