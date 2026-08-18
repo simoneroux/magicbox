@@ -113,6 +113,11 @@ class MagicBox:
         # Seeded by warm_up_sonos() and kept current by adjust_volume().
         self.current_volume = None
 
+        # Whether the speaker is in shuffle mode, as far as we know
+        # (None = unknown). Lets play_music() skip a redundant "shuffle
+        # off" round trip when the order is already normal.
+        self.shuffle_on = None
+
         # Every control command a tag (or a mouse button) can trigger,
         # defined once here. Two kinds of values:
         #   - a tuple ("sonos-subcommand", "message to print") for simple
@@ -430,25 +435,35 @@ class MagicBox:
             self.stop_video()
             threading.Thread(target=self.tv_off, daemon=True).start()
 
-            # Start fresh: empty the speaker's queue, then hand it the
-            # share link. soco-cli's play_sharelink understands public
-            # Spotify/Apple Music/Tidal/Deezer URLs and queues their
-            # contents (a track, album, or playlist).
-            self.run_sonos_command("clear_queue")
+            # For a normal-order card, make sure shuffle is off *before*
+            # we play, so playback starts on the album's first track —
+            # which _finish_music_setup() relies on to know which queued
+            # items are stale. Skipped when we already know it's off, so
+            # the common normal→normal tap pays nothing for it.
+            if not shuffle and self.shuffle_on is not False:
+                self.run_sonos_command("shuffle", "off")
+                self.shuffle_on = False
+
+            # Hand the speaker the share link. soco-cli's play_sharelink
+            # understands public Spotify/Apple Music/Tidal/Deezer URLs and
+            # queues their contents (a track, album, or playlist). We add
+            # without a foreground clear_queue: play_sharelink plays the
+            # new content immediately, and any stale items left in front
+            # are trimmed afterwards in the background (see below) — so the
+            # tap-to-sound path is one round trip shorter.
             code, _, stderr = self.run_sonos_command("play_sharelink", url)
 
             if code == 0:
                 # Something is now playing, so a middle-click should stop it.
                 self.is_playing = True
-                # Shuffle is a speaker-level toggle that would otherwise
-                # persist from the previous card, so set it explicitly
-                # either way.
-                if shuffle:
-                    self.run_sonos_command("shuffle", "on")
-                    print(f"🔀 Playing shuffled: {title or 'Music from tag'}")
-                else:
-                    self.run_sonos_command("shuffle", "off")
-                    print(f"▶️ Playing: {title or 'Music from tag'}")
+                # Queue tidy-up and shuffle mode happen off the critical
+                # path, after sound has already started.
+                threading.Thread(
+                    target=self._finish_music_setup,
+                    args=(shuffle,), daemon=True
+                ).start()
+                print(f"{'🔀 Playing shuffled' if shuffle else '▶️ Playing'}: "
+                      f"{title or 'Music from tag'}")
                 return True
             else:
                 print(f"❌ Failed: {stderr}")
@@ -458,6 +473,55 @@ class MagicBox:
             self.logger.error(f"Error playing URL: {e}")
             print("❌ Failed to play music from tag")
             return False
+
+    def _finish_music_setup(self, shuffle):
+        """Post-playback housekeeping, run in a background thread.
+
+        Playback has already started by the time this runs, so nothing
+        here is on the tap-to-sound path. It (a) trims stale queue items
+        left in front of the new content, and (b) applies the card's
+        shuffle mode.
+        """
+        # Let the transport settle on the new track before we inspect the
+        # queue, so playlist_position reflects the content we just added.
+        time.sleep(0.5)
+
+        if shuffle:
+            # Shuffle card: the play head may already be somewhere inside
+            # the new album, so we can't safely tell old items from new —
+            # skip the trim and just turn shuffle on.
+            if self.shuffle_on is not True:
+                self.run_sonos_command("shuffle", "on")
+                self.shuffle_on = True
+        else:
+            # Normal card: playback is on the album's first track, so
+            # everything ahead of it in the queue is stale and removable.
+            self._trim_queue_before_current()
+
+    def _trim_queue_before_current(self):
+        """Remove queued tracks sitting before the now-playing one.
+
+        Best-effort and defensive: any failure leaves the queue exactly
+        as it is. It must never remove the playing track, so it removes
+        strictly fewer items than the current 1-based playlist position.
+        """
+        if sonos_api is None:
+            # Shell-fallback mode has no cheap queue handle; leave it be.
+            return
+        try:
+            result = sonos_api.get_soco_object(self.room)
+            speaker = result[0] if isinstance(result, tuple) else result
+            if speaker is None:
+                return
+            position = int(speaker.get_current_track_info().get(
+                "playlist_position") or 0)
+            # playlist_position is 1-based; items 0..position-2 are stale.
+            # Removing index 0 repeatedly pulls the current track to the
+            # front without ever touching it. Capped as a paranoia guard.
+            for _ in range(min(max(0, position - 1), 1000)):
+                speaker.remove_from_queue(0)
+        except Exception as e:
+            self.logger.warning(f"Queue trim skipped (queue left intact): {e}")
 
     # ------------------------------------------------------------------
     # Control commands (the self.commands table)
