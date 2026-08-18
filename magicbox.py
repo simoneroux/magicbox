@@ -72,7 +72,7 @@ class MagicBox:
     # scroll wheel specifically, so it can't be cranked up to blast —
     # the wheel is the control the kids can reach.
     VOLUME_CAP = 50
-    WHEEL_MAX_VOLUME = 30
+    WHEEL_MAX_VOLUME = 20
     WHEEL_STEP = 2
     CARD_STEP = 5
 
