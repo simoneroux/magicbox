@@ -67,9 +67,12 @@ class MagicBox:
 
     # Volume control. WHEEL_STEP is the change per scroll-wheel notch —
     # small, so the wheel is a fine-grained knob. CARD_STEP is the
-    # coarser change for a vol_up/vol_down NFC card. VOLUME_CAP is a hard
-    # ceiling that protects ears and neighbours from a runaway delta.
+    # coarser change for a vol_up/vol_down NFC card. VOLUME_CAP is the
+    # hard ceiling for cards. WHEEL_MAX_VOLUME is a lower ceiling for the
+    # scroll wheel specifically, so it can't be cranked up to blast —
+    # the wheel is the control the kids can reach.
     VOLUME_CAP = 50
+    WHEEL_MAX_VOLUME = 40
     WHEEL_STEP = 2
     CARD_STEP = 5
 
@@ -499,8 +502,11 @@ class MagicBox:
         print(action[1] if code == 0 else f"❌ Failed: {stderr}")
         return code == 0
 
-    def adjust_volume(self, delta):
-        """Change Sonos volume by delta (e.g. +2 or -2), capped at VOLUME_CAP.
+    def adjust_volume(self, delta, cap=None):
+        """Change Sonos volume by delta (e.g. +2 or -2), clamped to [0, cap].
+
+        cap defaults to VOLUME_CAP; the scroll wheel passes the lower
+        WHEEL_MAX_VOLUME so it can't be cranked to a blast.
 
         Sonos has no relative-volume command, so we work out the target
         level and write it. To keep a fast scroll responsive we base the
@@ -508,6 +514,8 @@ class MagicBox:
         the speaker when we don't have one yet — halving the number of
         Sonos calls per notch from two (read+write) to one.
         """
+        if cap is None:
+            cap = self.VOLUME_CAP
         if self.current_volume is None:
             code, volume, _ = self.run_sonos_command("volume")
             if code != 0:
@@ -520,9 +528,9 @@ class MagicBox:
                 self.logger.error(f"Unexpected volume output: {volume!r}")
                 return
 
-        # Clamp between 0 and VOLUME_CAP; the ceiling protects ears and
+        # Clamp between 0 and cap; the ceiling protects ears and
         # neighbours from a misbehaving delta.
-        new_volume = max(0, min(self.VOLUME_CAP, self.current_volume + delta))
+        new_volume = max(0, min(cap, self.current_volume + delta))
         if new_volume == self.current_volume:
             # Already at the floor/ceiling — nothing to send.
             return
@@ -805,9 +813,9 @@ class MagicBox:
         # Small step per notch for fine control.
         if event.type == ecodes.EV_REL and event.code == ecodes.REL_WHEEL:
             if event.value > 0:
-                self.adjust_volume(self.WHEEL_STEP)
+                self.adjust_volume(self.WHEEL_STEP, cap=self.WHEEL_MAX_VOLUME)
             elif event.value < 0:
-                self.adjust_volume(-self.WHEEL_STEP)
+                self.adjust_volume(-self.WHEEL_STEP, cap=self.WHEEL_MAX_VOLUME)
             return
 
         # Buttons: act on the press (value == 1) only, so we ignore the
