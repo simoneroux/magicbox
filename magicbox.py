@@ -89,10 +89,12 @@ class MagicBox:
         self.sound_dir = tempfile.mkdtemp(prefix='magicbox-')
         self.sound_files = {}
 
-        # Optional mouse control. mouse_device is the evdev device once
-        # setup_mouse() finds one; is_playing is a best-effort flag so
-        # the middle-click button can toggle between play and stop.
-        self.mouse_device = None
+        # Optional mouse control. mouse_devices holds every evdev device
+        # setup_mouse() decides is worth listening to — a single mouse can
+        # expose more than one node (e.g. Logitech receivers put the scroll
+        # wheel on one and the side buttons on another). is_playing is a
+        # best-effort flag so the middle-click button can toggle play/stop.
+        self.mouse_devices = []
         self.is_playing = False
 
         # Every control command a tag (or a mouse button) can trigger,
@@ -632,26 +634,33 @@ class MagicBox:
             return False
 
         try:
-            self.mouse_device = self._find_mouse_device(evdev)
+            self.mouse_devices = self._find_mouse_devices(evdev)
         except Exception as e:
             self.logger.error(f"Mouse detection error: {e}")
             return False
 
-        if self.mouse_device:
-            self.logger.info(f"Mouse control enabled: {self.mouse_device.name}")
+        if self.mouse_devices:
+            names = ", ".join(d.name for d in self.mouse_devices)
+            self.logger.info(f"Mouse control enabled: {names}")
             return True
 
         self.logger.info("No mouse found; mouse control disabled")
         return False
 
-    def _find_mouse_device(self, evdev):
-        """Return the first input device that looks like a mouse, or None.
+    def _find_mouse_devices(self, evdev):
+        """Return every input device we should listen to for mouse control.
 
-        A mouse is anything that reports a scroll wheel (REL_WHEEL) or
-        mouse buttons (BTN_MOUSE) in its capabilities. Reading
-        /dev/input requires membership in the 'input' group.
+        We keep any device that reports a scroll wheel (REL_WHEEL), mouse
+        buttons (BTN_MOUSE), or one of the side/media buttons we map to a
+        control. That last case matters: a single physical mouse often
+        splits its inputs across several /dev/input nodes — the pointer
+        and wheel on one, the "forward/back" side buttons on another —
+        so listening to only the first node silently drops those buttons.
+        Reading /dev/input requires membership in the 'input' group.
         """
         from evdev import ecodes
+        wanted_keys = set(self._button_actions(ecodes))
+        devices = []
         for path in evdev.list_devices():
             try:
                 dev = evdev.InputDevice(path)
@@ -661,52 +670,99 @@ class MagicBox:
             caps = dev.capabilities()
             rel_axes = caps.get(ecodes.EV_REL, [])
             keys = caps.get(ecodes.EV_KEY, [])
-            if ecodes.REL_WHEEL in rel_axes or ecodes.BTN_MOUSE in keys:
-                return dev
-        return None
+            if (ecodes.REL_WHEEL in rel_axes
+                    or ecodes.BTN_MOUSE in keys
+                    or wanted_keys.intersection(keys)):
+                devices.append(dev)
+        return devices
 
     def _toggle_play_stop(self):
         """Middle-click: stop if we think we're playing, else resume."""
         self.handle_control("stop" if self.is_playing else "play")
 
+    def _button_actions(self, ecodes):
+        """Map evdev key codes to control commands for mouse buttons.
+
+        The two side buttons report different codes on different mice, so
+        each control lists every code it plausibly arrives as: the plain
+        mouse buttons (BTN_*) and the media-key codes (KEY_*) that some
+        mice send for the same physical buttons. "toggle" is handled
+        specially (play/stop), the rest are ordinary handle_control names.
+        """
+        return {
+            ecodes.BTN_FORWARD: "next",
+            ecodes.BTN_EXTRA: "next",
+            ecodes.KEY_NEXTSONG: "next",
+            ecodes.KEY_FORWARD: "next",
+            ecodes.BTN_BACK: "prev",
+            ecodes.BTN_SIDE: "prev",
+            ecodes.KEY_PREVIOUSSONG: "prev",
+            ecodes.KEY_BACK: "prev",
+            ecodes.BTN_MIDDLE: "toggle",
+            ecodes.KEY_PLAYPAUSE: "toggle",
+        }
+
     def start_mouse_listener(self):
         """Map mouse events to playback controls; runs in its own thread.
 
-        Scroll wheel  -> volume up/down
+        Scroll wheel  -> volume up/down (silent; no per-notch beep)
         Side buttons  -> next / previous track
         Middle click  -> play/stop toggle
 
-        We reuse the same handle_control() commands the NFC cards use,
-        so mouse and tag controls behave identically (same beeps, same
-        messages).
+        Reads from every device setup_mouse() found, because one mouse can
+        spread the wheel and the side buttons across separate input nodes.
+        A selector lets us watch them all at once while still checking
+        is_running (so shutdown doesn't hang on a quiet mouse).
         """
         from evdev import ecodes
+        from selectors import DefaultSelector, EVENT_READ
+
+        actions = self._button_actions(ecodes)
+        selector = DefaultSelector()
+        for dev in self.mouse_devices:
+            selector.register(dev, EVENT_READ)
+
         try:
-            for event in self.mouse_device.read_loop():
-                if not self.is_running:
-                    break
-
-                # Scroll wheel: one notch up or down per event.
-                if event.type == ecodes.EV_REL and event.code == ecodes.REL_WHEEL:
-                    if event.value > 0:
-                        self.handle_control("vol_up")
-                    elif event.value < 0:
-                        self.handle_control("vol_down")
-
-                # Buttons: act on the press (value == 1) only, so we
-                # ignore the release event and any auto-repeat.
-                elif event.type == ecodes.EV_KEY and event.value == 1:
-                    if event.code in (ecodes.BTN_FORWARD, ecodes.BTN_EXTRA):
-                        self.handle_control("next")
-                    elif event.code in (ecodes.BTN_BACK, ecodes.BTN_SIDE):
-                        self.handle_control("prev")
-                    elif event.code == ecodes.BTN_MIDDLE:
-                        self._toggle_play_stop()
-
+            while self.is_running and selector.get_map():
+                for key, _ in selector.select(timeout=1):
+                    dev = key.fileobj
+                    try:
+                        events = list(dev.read())
+                    except OSError:
+                        # Device unplugged: stop watching it, keep the rest.
+                        selector.unregister(dev)
+                        continue
+                    for event in events:
+                        self._handle_mouse_event(event, ecodes, actions)
         except Exception as e:
             # A mouse unplug or read error shouldn't crash the box; the
             # NFC reader keeps working.
             self.logger.error(f"Mouse listener error: {e}")
+
+    def _handle_mouse_event(self, event, ecodes, actions):
+        """Turn one evdev event into a control command."""
+        # Scroll wheel: adjust volume directly (not via handle_control) so
+        # scrolling doesn't fire the success beep on every single notch.
+        if event.type == ecodes.EV_REL and event.code == ecodes.REL_WHEEL:
+            if event.value > 0:
+                self.adjust_volume(5)
+            elif event.value < 0:
+                self.adjust_volume(-5)
+            return
+
+        # Buttons: act on the press (value == 1) only, so we ignore the
+        # release event and any auto-repeat.
+        if event.type == ecodes.EV_KEY and event.value == 1:
+            command = actions.get(event.code)
+            if command == "toggle":
+                self._toggle_play_stop()
+            elif command:
+                self.handle_control(command)
+            else:
+                # Unmapped press — log the code so an unrecognised side
+                # button can be identified and added to _button_actions.
+                name = ecodes.keys.get(event.code, event.code)
+                self.logger.info(f"Unmapped mouse button: {name} ({event.code})")
 
     # ------------------------------------------------------------------
     # Startup and shutdown
