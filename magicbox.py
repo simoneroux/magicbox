@@ -750,15 +750,17 @@ class MagicBox:
             self.mouse_devices = self._find_mouse_devices(evdev)
         except Exception as e:
             self.logger.error(f"Mouse detection error: {e}")
-            return False
+            self.mouse_devices = []
 
         if self.mouse_devices:
             names = ", ".join(d.name for d in self.mouse_devices)
             self.logger.info(f"Mouse control enabled: {names}")
-            return True
-
-        self.logger.info("No mouse found; mouse control disabled")
-        return False
+        else:
+            # No mouse right now, but evdev works — the listener keeps
+            # rescanning, so a mouse plugged in (or woken from sleep)
+            # later starts working without a restart.
+            self.logger.info("Mouse control enabled: waiting for a mouse")
+        return True
 
     def _find_mouse_devices(self, evdev):
         """Return every input device we should listen to for mouse control.
@@ -840,35 +842,95 @@ class MagicBox:
         Left / right click  -> previous / next track
         Middle click        -> play/pause toggle
 
-        Reads from every device setup_mouse() found, because one mouse can
-        spread the wheel and the side buttons across separate input nodes.
-        A selector lets us watch them all at once while still checking
-        is_running (so shutdown doesn't hang on a quiet mouse).
+        Self-healing supervisor: it watches every mouse node at once (one
+        mouse can spread the wheel and buttons across several nodes) and
+        rescans every few seconds. That matters for wireless mice, which
+        sleep to save power and re-appear as a *new* /dev/input node when
+        they wake — the old node is dropped on read error and the new one
+        is picked up on the next rescan, so the mouse keeps working
+        without a service restart. The loop never exits on its own while
+        the box is running, even when no mouse is currently present.
         """
+        import evdev
         from evdev import ecodes
         from selectors import DefaultSelector, EVENT_READ
 
         actions = self._button_actions(ecodes)
         selector = DefaultSelector()
-        for dev in self.mouse_devices:
-            selector.register(dev, EVENT_READ)
+        watched = {}   # device path -> InputDevice we're reading from
 
-        try:
-            while self.is_running and selector.get_map():
-                for key, _ in selector.select(timeout=1):
-                    dev = key.fileobj
+        def watch(dev):
+            try:
+                selector.register(dev, EVENT_READ)
+                watched[dev.path] = dev
+                self.logger.info(f"Mouse node connected: {dev.name} ({dev.path})")
+            except Exception:
+                self._close_device(dev)
+
+        def unwatch(dev):
+            try:
+                selector.unregister(dev)
+            except Exception:
+                pass
+            watched.pop(getattr(dev, "path", None), None)
+            self._close_device(dev)
+
+        def rescan():
+            """Register any mouse node we're not already reading from."""
+            try:
+                found = self._find_mouse_devices(evdev)
+            except Exception as e:
+                self.logger.debug(f"Mouse rescan failed: {e}")
+                return
+            for dev in found:
+                if dev.path in watched:
+                    self._close_device(dev)   # already watching; drop the dup
+                else:
+                    watch(dev)
+
+        # Seed from whatever setup_mouse() already opened, then supervise.
+        for dev in self.mouse_devices:
+            watch(dev)
+        self.mouse_devices = []   # ownership now lives in `watched`
+
+        last_scan = 0.0
+        while self.is_running:
+            # Periodically look for mice that appeared or came back.
+            if time.monotonic() - last_scan >= 3:
+                rescan()
+                last_scan = time.monotonic()
+
+            try:
+                ready = selector.select(timeout=1)
+            except Exception:
+                # Nothing registered yet, or a transient selector error.
+                time.sleep(0.5)
+                continue
+
+            for key, _ in ready:
+                dev = key.fileobj
+                try:
+                    events = list(dev.read())
+                except OSError:
+                    # Node went away (mouse slept/unplugged). Drop it; the
+                    # rescan will pick up its replacement when it returns.
+                    unwatch(dev)
+                    continue
+                for event in events:
                     try:
-                        events = list(dev.read())
-                    except OSError:
-                        # Device unplugged: stop watching it, keep the rest.
-                        selector.unregister(dev)
-                        continue
-                    for event in events:
                         self._handle_mouse_event(event, ecodes, actions)
-        except Exception as e:
-            # A mouse unplug or read error shouldn't crash the box; the
-            # NFC reader keeps working.
-            self.logger.error(f"Mouse listener error: {e}")
+                    except Exception as e:
+                        self.logger.error(f"Mouse event error: {e}")
+
+        for dev in list(watched.values()):
+            unwatch(dev)
+
+    def _close_device(self, dev):
+        """Close an evdev device handle, ignoring any error."""
+        try:
+            dev.close()
+        except Exception:
+            pass
 
     def _handle_mouse_event(self, event, ecodes, actions):
         """Turn one evdev event into a control command."""
