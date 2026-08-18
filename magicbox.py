@@ -65,6 +65,14 @@ class MagicBox:
         "scan": {"freq": 660, "duration": 0.1}
     }
 
+    # Volume control. WHEEL_STEP is the change per scroll-wheel notch —
+    # small, so the wheel is a fine-grained knob. CARD_STEP is the
+    # coarser change for a vol_up/vol_down NFC card. VOLUME_CAP is a hard
+    # ceiling that protects ears and neighbours from a runaway delta.
+    VOLUME_CAP = 50
+    WHEEL_STEP = 2
+    CARD_STEP = 5
+
     def __init__(self, room):
         # Name of the Sonos room/speaker to control, e.g. "Kitchen".
         # Passed to every `sonos` command.
@@ -97,6 +105,11 @@ class MagicBox:
         self.mouse_devices = []
         self.is_playing = False
 
+        # Last volume we know the speaker is at, cached so a scroll-wheel
+        # notch is a single "set" call instead of a read-then-write.
+        # Seeded by warm_up_sonos() and kept current by adjust_volume().
+        self.current_volume = None
+
         # Every control command a tag (or a mouse button) can trigger,
         # defined once here. Two kinds of values:
         #   - a tuple ("sonos-subcommand", "message to print") for simple
@@ -109,8 +122,8 @@ class MagicBox:
             "stop": lambda: (self.stop_video(), self.run_sonos_command("stop")),
             "next": ("next", "⏭️ Next track"),
             "prev": ("previous", "⏮️ Previous track"),
-            "vol_up": lambda: self.adjust_volume(5),
-            "vol_down": lambda: self.adjust_volume(-5),
+            "vol_up": lambda: self.adjust_volume(self.CARD_STEP),
+            "vol_down": lambda: self.adjust_volume(-self.CARD_STEP),
             "tv_on": self.tv_on,
             "tv_off": self.tv_off
         }
@@ -122,6 +135,12 @@ class MagicBox:
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger(__name__)
+
+        # soco-cli logs every speaker lookup and command at INFO ("Trying
+        # direct cache lookup", "Return value: ...") — far too chatty when
+        # a scroll wheel fires commands rapidly. Quiet it to warnings.
+        for noisy in ("soco_cli", "soco"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # ------------------------------------------------------------------
     # Feedback beeps
@@ -385,9 +404,15 @@ class MagicBox:
         speaker discovery now, while nobody is waiting, instead of on
         the first scanned card.
         """
-        code, _, error = self.run_sonos_command("volume")
+        code, volume, error = self.run_sonos_command("volume")
         if code == 0:
             self.logger.info(f"Sonos speaker '{self.room}' found and cached")
+            # Seed the volume cache so the first scroll notch is a single
+            # "set" call rather than a read-then-write.
+            try:
+                self.current_volume = int(volume)
+            except ValueError:
+                pass
         else:
             self.logger.warning(f"Sonos warm-up failed: {error}")
 
@@ -435,14 +460,19 @@ class MagicBox:
     # Control commands (the self.commands table)
     # ------------------------------------------------------------------
 
-    def handle_control(self, command):
+    def handle_control(self, command, beep=True):
         """Run one control command from the self.commands table.
 
         Works for both music and video: e.g. "stop" halts VLC and the
         Sonos speaker at the same time. Returns True on success.
+
+        beep=False suppresses the feedback beep — used by the mouse
+        remote, where beeping on every click gets annoying (the tap of
+        an NFC card still beeps).
         """
         if command not in self.commands:
-            self.play_sound("error")
+            if beep:
+                self.play_sound("error")
             return False
 
         # Keep the middle-click toggle roughly in sync with reality.
@@ -457,36 +487,47 @@ class MagicBox:
         # handle their own logic and printing.
         if callable(action):
             action()
-            self.play_sound("success")
+            if beep:
+                self.play_sound("success")
             print(f"✅ {command}")
             return True
 
         # Tuple entries are (sonos subcommand, success message).
         code, _, stderr = self.run_sonos_command(action[0])
-        self.play_sound("success" if code == 0 else "error")
+        if beep:
+            self.play_sound("success" if code == 0 else "error")
         print(action[1] if code == 0 else f"❌ Failed: {stderr}")
         return code == 0
 
     def adjust_volume(self, delta):
-        """Change Sonos volume by delta (e.g. +5 or -5), capped at 60.
+        """Change Sonos volume by delta (e.g. +2 or -2), capped at VOLUME_CAP.
 
-        Sonos has no relative-volume command, so we read the current
-        level, add the delta, and write the result back.
+        Sonos has no relative-volume command, so we work out the target
+        level and write it. To keep a fast scroll responsive we base the
+        change on the cached level (self.current_volume) and only read
+        the speaker when we don't have one yet — halving the number of
+        Sonos calls per notch from two (read+write) to one.
         """
-        code, volume, _ = self.run_sonos_command("volume")
-        if code != 0:
-            return
-        try:
-            current = int(volume)
-        except ValueError:
-            # soco-cli printed something unexpected; better to do
-            # nothing than to set a wild volume.
-            self.logger.error(f"Unexpected volume output: {volume!r}")
-            return
-        # Clamp between 0 and 60 — the ceiling protects ears and
+        if self.current_volume is None:
+            code, volume, _ = self.run_sonos_command("volume")
+            if code != 0:
+                return
+            try:
+                self.current_volume = int(volume)
+            except ValueError:
+                # soco-cli printed something unexpected; better to do
+                # nothing than to set a wild volume.
+                self.logger.error(f"Unexpected volume output: {volume!r}")
+                return
+
+        # Clamp between 0 and VOLUME_CAP; the ceiling protects ears and
         # neighbours from a misbehaving delta.
-        new_volume = max(0, min(60, current + delta))
+        new_volume = max(0, min(self.VOLUME_CAP, self.current_volume + delta))
+        if new_volume == self.current_volume:
+            # Already at the floor/ceiling — nothing to send.
+            return
         self.run_sonos_command("volume", str(new_volume))
+        self.current_volume = new_volume
         print(f"{'🔊' if delta > 0 else '🔉'} {new_volume}%")
 
     # ------------------------------------------------------------------
@@ -677,19 +718,37 @@ class MagicBox:
         return devices
 
     def _toggle_play_stop(self):
-        """Middle-click: stop if we think we're playing, else resume."""
-        self.handle_control("stop" if self.is_playing else "play")
+        """Middle-click: pause if the speaker is playing, else resume.
+
+        Uses pause (not stop) so playback resumes where it left off
+        instead of restarting the track, and reads the speaker's real
+        transport state so the toggle stays correct even if our
+        is_playing flag has drifted. Falls back to the flag if the
+        state query fails. Silent — no feedback beep.
+        """
+        code, state, _ = self.run_sonos_command("state")
+        playing = ("PLAYING" in state.upper()) if code == 0 and state else self.is_playing
+        if playing:
+            self.run_sonos_command("pause")
+            self.is_playing = False
+            print("⏸️ Paused")
+        else:
+            self.run_sonos_command("play")
+            self.is_playing = True
+            print("▶️ Playing")
 
     def _button_actions(self, ecodes):
         """Map evdev key codes to control commands for mouse buttons.
 
-        The two side buttons report different codes on different mice, so
-        each control lists every code it plausibly arrives as: the plain
-        mouse buttons (BTN_*) and the media-key codes (KEY_*) that some
-        mice send for the same physical buttons. "toggle" is handled
-        specially (play/stop), the rest are ordinary handle_control names.
+        This mouse reports only left/right/middle/wheel (no separate
+        forward/back side buttons), so left and right clicks drive
+        previous/next. The BTN_SIDE/EXTRA and media KEY_* codes are kept
+        as well, harmlessly, for mice that do have real side buttons.
+        "toggle" is play/pause; the rest are handle_control names.
         """
         return {
+            ecodes.BTN_LEFT: "prev",
+            ecodes.BTN_RIGHT: "next",
             ecodes.BTN_FORWARD: "next",
             ecodes.BTN_EXTRA: "next",
             ecodes.KEY_NEXTSONG: "next",
@@ -705,9 +764,9 @@ class MagicBox:
     def start_mouse_listener(self):
         """Map mouse events to playback controls; runs in its own thread.
 
-        Scroll wheel  -> volume up/down (silent; no per-notch beep)
-        Side buttons  -> next / previous track
-        Middle click  -> play/stop toggle
+        Scroll wheel        -> volume up/down (silent; no per-notch beep)
+        Left / right click  -> previous / next track
+        Middle click        -> play/pause toggle
 
         Reads from every device setup_mouse() found, because one mouse can
         spread the wheel and the side buttons across separate input nodes.
@@ -743,11 +802,12 @@ class MagicBox:
         """Turn one evdev event into a control command."""
         # Scroll wheel: adjust volume directly (not via handle_control) so
         # scrolling doesn't fire the success beep on every single notch.
+        # Small step per notch for fine control.
         if event.type == ecodes.EV_REL and event.code == ecodes.REL_WHEEL:
             if event.value > 0:
-                self.adjust_volume(5)
+                self.adjust_volume(self.WHEEL_STEP)
             elif event.value < 0:
-                self.adjust_volume(-5)
+                self.adjust_volume(-self.WHEEL_STEP)
             return
 
         # Buttons: act on the press (value == 1) only, so we ignore the
@@ -757,7 +817,9 @@ class MagicBox:
             if command == "toggle":
                 self._toggle_play_stop()
             elif command:
-                self.handle_control(command)
+                # beep=False: the mouse is a quiet remote, so next/prev
+                # don't chirp the way an NFC card tap does.
+                self.handle_control(command, beep=False)
             else:
                 # Unmapped press — log the code so an unrecognised side
                 # button can be identified and added to _button_actions.
@@ -822,7 +884,7 @@ class MagicBox:
         print(f"🎬 Video Playback: Enabled")
         print(f"🎮 Universal Controls: stop, vol_up, vol_down")
         if mouse_enabled:
-            print(f"🖱️  Mouse: scroll=volume, side buttons=track, middle=play/stop")
+            print(f"🖱️  Mouse: scroll=volume, left/right=prev/next, middle=play/pause")
         print("\nScan tag to begin... (Ctrl+C or Ctrl+Z to quit)")
 
         self.play_sound("info")
