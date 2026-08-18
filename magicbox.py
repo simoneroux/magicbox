@@ -12,9 +12,18 @@ import numpy as np
 import tempfile
 
 class MagicBox:
+    # Fixed feedback tones — generated once and replayed, never rebuilt per scan.
+    SOUNDS = {
+        "success": {"freq": 880, "duration": 0.2},
+        "error": {"freq": 220, "duration": 0.3},
+        "info": {"freq": 440, "duration": 0.2},
+        "scan": {"freq": 660, "duration": 0.1},
+    }
+
     def __init__(self, room):
         self.room = room
         self.speaker_ip = None  # Cached once, reused to skip per-command discovery
+        self.sound_files = {}   # sound_type -> pre-generated WAV path
         self.clf = None
         self.is_running = True
         self.vlc_process = None
@@ -25,50 +34,55 @@ class MagicBox:
         )
         self.logger = logging.getLogger(__name__)
 
+    def _write_wav(self, path, freq, duration):
+        """Render a single sine-wave tone to a mono 16-bit WAV file."""
+        sample_rate = 22050
+        amplitude = 0.5
+
+        t = np.linspace(0, duration, int(sample_rate * duration), False)
+        tone = np.sin(2 * np.pi * freq * t) * amplitude
+        audio = (tone * 32767).astype(np.int16)
+
+        with open(path, 'wb') as f:
+            f.write(b'RIFF')
+            f.write((36 + len(audio) * 2).to_bytes(4, 'little'))
+            f.write(b'WAVE')
+            f.write(b'fmt ')
+            f.write((16).to_bytes(4, 'little'))
+            f.write((1).to_bytes(2, 'little'))
+            f.write((1).to_bytes(2, 'little'))
+            f.write((sample_rate).to_bytes(4, 'little'))
+            f.write((sample_rate * 2).to_bytes(4, 'little'))
+            f.write((2).to_bytes(2, 'little'))
+            f.write((16).to_bytes(2, 'little'))
+            f.write(b'data')
+            f.write((len(audio) * 2).to_bytes(4, 'little'))
+            f.write(audio.tobytes())
+
+    def prepare_sounds(self):
+        """Pre-generate every feedback tone once so scans just replay a file."""
+        for name, cfg in self.SOUNDS.items():
+            try:
+                fd, path = tempfile.mkstemp(suffix='.wav', prefix=f'magicbox_{name}_')
+                os.close(fd)
+                self._write_wav(path, cfg["freq"], cfg["duration"])
+                self.sound_files[name] = path
+            except Exception as e:
+                self.logger.error(f"Failed to prepare sound '{name}': {e}")
+
     def play_sound(self, sound_type="success"):
-        """Play a feedback sound through the Raspberry Pi headphone jack"""
+        """Play a pre-generated feedback tone without blocking the caller."""
         try:
-            sounds = {
-                "success": {"freq": 880, "duration": 0.2},
-                "error": {"freq": 220, "duration": 0.3},
-                "info": {"freq": 440, "duration": 0.2},
-                "scan": {"freq": 660, "duration": 0.1}
-            }
-            
-            config = sounds.get(sound_type, sounds["success"])
-            freq = config["freq"]
-            duration = config["duration"]
-            sample_rate = 22050
-            amplitude = 0.5
-            
-            t = np.linspace(0, duration, int(sample_rate * duration), False)
-            tone = np.sin(2 * np.pi * freq * t) * amplitude
-            audio = (tone * 32767).astype(np.int16)
-            
-            fd, temp_file = tempfile.mkstemp(suffix='.wav')
-            os.close(fd)
-            
-            with open(temp_file, 'wb') as f:
-                f.write(b'RIFF')
-                f.write((36 + len(audio) * 2).to_bytes(4, 'little'))
-                f.write(b'WAVE')
-                f.write(b'fmt ')
-                f.write((16).to_bytes(4, 'little'))
-                f.write((1).to_bytes(2, 'little'))
-                f.write((1).to_bytes(2, 'little'))
-                f.write((sample_rate).to_bytes(4, 'little'))
-                f.write((sample_rate * 2).to_bytes(4, 'little'))
-                f.write((2).to_bytes(2, 'little'))
-                f.write((16).to_bytes(2, 'little'))
-                f.write(b'data')
-                f.write((len(audio) * 2).to_bytes(4, 'little'))
-                f.write(audio.tobytes())
-            
-            subprocess.run(['aplay', '-q', temp_file], 
-                           stdout=subprocess.DEVNULL, 
-                           stderr=subprocess.DEVNULL)
-            os.unlink(temp_file)
-            
+            path = self.sound_files.get(sound_type) or self.sound_files.get("success")
+            if not path:
+                # Sounds weren't prepared (e.g. play_sound called very early);
+                # skip rather than rebuilding a WAV on the hot path.
+                return
+            # Non-blocking: the beep plays while we get on with parsing the tag
+            # and issuing the Sonos command.
+            subprocess.Popen(['aplay', '-q', path],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
         except Exception as e:
             self.logger.error(f"Failed to play sound: {e}")
 
@@ -442,10 +456,22 @@ class MagicBox:
         
         self.play_sound("info")
         time.sleep(0.3)
+
+        # Remove the pre-generated tone files.
+        for path in self.sound_files.values():
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
         sys.exit(0)
 
     def start(self):
         """Start the Magic Box"""
+        # Generate the feedback tones once, up front, so every later beep is
+        # just a file replay (and so the setup-failure beep below works).
+        self.prepare_sounds()
+
         if not self.setup_nfc():
             print("❌ NFC setup failed")
             self.play_sound("error")
