@@ -27,6 +27,8 @@ class MagicBox:
         self.clf = None
         self.is_running = True
         self.vlc_process = None
+        self.mouse_device = None  # evdev device, if a mouse is connected
+        self.is_playing = False   # best-effort state for the middle-click toggle
         
         logging.basicConfig(
             level=logging.INFO,
@@ -295,6 +297,7 @@ class MagicBox:
             )
 
             if code == 0:
+                self.is_playing = True
                 if shuffle:
                     print(f"🔀 Playing shuffled: {title or 'Music from tag'}")
                 else:
@@ -333,6 +336,12 @@ class MagicBox:
         if command not in commands:
             self.play_sound("error")
             return False
+
+        # Keep the middle-click toggle roughly in sync with reality.
+        if command == "play":
+            self.is_playing = True
+        elif command == "stop":
+            self.is_playing = False
 
         action = commands[command]
         if callable(action):
@@ -441,6 +450,81 @@ class MagicBox:
                 self.logger.error(f"NFC error: {e}")
                 time.sleep(1)
 
+    def setup_mouse(self):
+        """Find a connected mouse to use for playback control (optional).
+
+        Uses python-evdev. If it isn't installed or no mouse is present, mouse
+        control is simply disabled and the NFC reader keeps working as before.
+        """
+        try:
+            import evdev
+        except ImportError:
+            self.logger.info("python-evdev not installed; mouse control disabled")
+            return False
+
+        try:
+            self.mouse_device = self._find_mouse_device(evdev)
+        except Exception as e:
+            self.logger.error(f"Mouse detection error: {e}")
+            return False
+
+        if self.mouse_device:
+            self.logger.info(f"Mouse control enabled: {self.mouse_device.name}")
+            return True
+
+        self.logger.info("No mouse found; mouse control disabled")
+        return False
+
+    def _find_mouse_device(self, evdev):
+        """Return the first input device that looks like a mouse, or None."""
+        from evdev import ecodes
+        for path in evdev.list_devices():
+            try:
+                dev = evdev.InputDevice(path)
+            except Exception:
+                continue
+            caps = dev.capabilities()
+            rel_axes = caps.get(ecodes.EV_REL, [])
+            keys = caps.get(ecodes.EV_KEY, [])
+            # A mouse reports relative axes (movement/wheel) and mouse buttons.
+            if ecodes.REL_WHEEL in rel_axes or ecodes.BTN_MOUSE in keys:
+                return dev
+        return None
+
+    def _toggle_play_stop(self):
+        """Middle-click: stop if we think we're playing, otherwise resume."""
+        self.handle_control("stop" if self.is_playing else "play")
+
+    def start_mouse_listener(self):
+        """Map mouse events to playback controls.
+
+        Scroll wheel -> volume, side buttons -> next/previous track,
+        middle click -> play/stop toggle.
+        """
+        from evdev import ecodes
+        try:
+            for event in self.mouse_device.read_loop():
+                if not self.is_running:
+                    break
+
+                if event.type == ecodes.EV_REL and event.code == ecodes.REL_WHEEL:
+                    if event.value > 0:
+                        self.handle_control("vol_up")
+                    elif event.value < 0:
+                        self.handle_control("vol_down")
+
+                # Buttons: act on press only (value == 1), not release/autorepeat.
+                elif event.type == ecodes.EV_KEY and event.value == 1:
+                    if event.code in (ecodes.BTN_FORWARD, ecodes.BTN_EXTRA):
+                        self.handle_control("next")
+                    elif event.code in (ecodes.BTN_BACK, ecodes.BTN_SIDE):
+                        self.handle_control("prev")
+                    elif event.code == ecodes.BTN_MIDDLE:
+                        self._toggle_play_stop()
+
+        except Exception as e:
+            self.logger.error(f"Mouse listener error: {e}")
+
     def handle_quit(self, signum, frame):
         """Clean shutdown on Ctrl+C/Z"""
         print("\n👋 Shutting down Magic Box...")
@@ -484,18 +568,28 @@ class MagicBox:
         # pay for discovery. Done in the background so startup isn't blocked.
         threading.Thread(target=self.resolve_speaker_ip, daemon=True).start()
 
+        # Optional mouse control (scroll = volume, side buttons = track).
+        mouse_enabled = self.setup_mouse()
+
         print("\n✨ Magic Box Ready")
         print(f"🔈 Sonos: {self.room}")
         print(f"📺 TV Control: Enabled (with smart detection)")
         print(f"🎬 Video Playback: Enabled")
         print(f"🎮 Universal Controls: stop, vol_up, vol_down")
+        if mouse_enabled:
+            print(f"🖱️  Mouse: scroll=volume, side buttons=track, middle=play/stop")
         print("\nScan tag to begin... (Ctrl+C or Ctrl+Z to quit)")
-        
+
         self.play_sound("info")
-        
+
         nfc_thread = threading.Thread(target=self.start_nfc_listener)
         nfc_thread.daemon = True
         nfc_thread.start()
+
+        if mouse_enabled:
+            mouse_thread = threading.Thread(target=self.start_mouse_listener)
+            mouse_thread.daemon = True
+            mouse_thread.start()
         
         while self.is_running:
             time.sleep(1)
