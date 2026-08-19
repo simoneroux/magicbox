@@ -765,16 +765,25 @@ class MagicBox:
     def _find_mouse_devices(self, evdev):
         """Return every input device we should listen to for mouse control.
 
-        We keep any device that reports a scroll wheel (REL_WHEEL), mouse
-        buttons (BTN_MOUSE), or one of the side/media buttons we map to a
-        control. That last case matters: a single physical mouse often
-        splits its inputs across several /dev/input nodes — the pointer
-        and wheel on one, the "forward/back" side buttons on another —
-        so listening to only the first node silently drops those buttons.
-        Reading /dev/input requires membership in the 'input' group.
+        We keep a device only if it looks like a real pointer: it reports
+        a scroll wheel (REL_WHEEL) or actual mouse buttons (BTN_*). A
+        physical mouse can split its inputs across several /dev/input
+        nodes — the pointer and wheel on one, the side buttons on another
+        — so we scan all of them, not just the first.
+
+        We deliberately do NOT match on media KEY_* codes (play/next/…):
+        HDMI-CEC and TV-remote devices (e.g. 'vc4-hdmi') advertise those
+        for remote passthrough, and grabbing one would inject stray
+        playback commands and can spin the read loop. Reading /dev/input
+        requires membership in the 'input' group.
         """
         from evdev import ecodes
-        wanted_keys = set(self._button_actions(ecodes))
+        # Any genuine mouse button; excludes consumer/media KEY_* codes.
+        mouse_buttons = {
+            ecodes.BTN_MOUSE, ecodes.BTN_LEFT, ecodes.BTN_RIGHT,
+            ecodes.BTN_MIDDLE, ecodes.BTN_SIDE, ecodes.BTN_EXTRA,
+            ecodes.BTN_FORWARD, ecodes.BTN_BACK,
+        }
         devices = []
         for path in evdev.list_devices():
             try:
@@ -786,9 +795,12 @@ class MagicBox:
             rel_axes = caps.get(ecodes.EV_REL, [])
             keys = caps.get(ecodes.EV_KEY, [])
             if (ecodes.REL_WHEEL in rel_axes
-                    or ecodes.BTN_MOUSE in keys
-                    or wanted_keys.intersection(keys)):
+                    or mouse_buttons.intersection(keys)):
                 devices.append(dev)
+            else:
+                # Not a mouse — close it, or we'd leak a file descriptor
+                # on every rescan (this runs every few seconds).
+                self._close_device(dev)
         return devices
 
     def _toggle_play_stop(self):
